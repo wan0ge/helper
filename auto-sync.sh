@@ -572,7 +572,7 @@ if [ "$DO_PUBLISH" = "1" ] && [ "$DATA_COMMITTED" = "1" ]; then
     get_upstream_info
     log "上游版本信息获取完成: UPSTREAM_VER=$UPSTREAM_VER"
 
-    CURRENT_VER=$(node -e "console.log(require('$HELPER_DIR/package.json').version)")
+    CURRENT_VER=$(node -e "console.log(require('./package.json').version)" 2>/dev/null || echo "0.3.200")
     log "当前 package.json 版本: $CURRENT_VER"
 
     if [ "$TEST_COMMIT" = "1" ] || [ "$TEST_FULL" = "1" ]; then
@@ -663,23 +663,25 @@ if [ "$DATA_COMMITTED" = "1" ] || [ "$FORCE_PUSH" = "1" ]; then
     die "bangumi-data 推送失败（master 分支），已重试3次"
   fi
 
-  # 推 tags：只推当前 package.json 中的版本 tag（避免遍历全部历史 tag）
+  # 推 tags：用本次构建的 NEXT_VER，不重新读 package.json（避免在 helper 目录读到旧版本）
   log "推送 bangumi-data tags..."
-  CURRENT_VER_TAG="v$(node -e "console.log(require('$HELPER_DIR/package.json').version)" 2>/dev/null)"
-  if [ -n "$CURRENT_VER_TAG" ] && [ "$CURRENT_VER_TAG" != "v" ]; then
-    remote_ref="$(git ls-remote --tags origin "refs/tags/$CURRENT_VER_TAG" 2>/dev/null | awk '{print $1}')"
-    local_ref="$(git rev-parse "$CURRENT_VER_TAG" 2>/dev/null)"
+  NEXT_VER_TAG="v$NEXT_VER"
+  if [ -n "$NEXT_VER_TAG" ] && [ "$NEXT_VER_TAG" != "v" ]; then
+    remote_ref="$(git ls-remote --tags origin "refs/tags/$NEXT_VER_TAG" 2>/dev/null | awk '{print $1}')"
+    local_ref="$(git rev-parse "$NEXT_VER_TAG" 2>/dev/null)"
     if [ -z "$remote_ref" ]; then
-      log "tag $CURRENT_VER_TAG 远端不存在，创建..."
-      git_with_proxy push origin "refs/tags/$CURRENT_VER_TAG" "bangumi-data/bangumi-data (tag $CURRENT_VER_TAG)"
+      log "tag $NEXT_VER_TAG 远端不存在，创建..."
+      git tag -f "$NEXT_VER_TAG" >/dev/null 2>&1
+      git_with_proxy push origin "refs/tags/$NEXT_VER_TAG" "bangumi-data/bangumi-data (tag $NEXT_VER_TAG)"
     elif [ "$local_ref" != "$remote_ref" ]; then
-      log "tag $CURRENT_VER_TAG 远端指向不同 commit ($remote_ref)，强制更新..."
-      git_with_proxy push origin "refs/tags/$CURRENT_VER_TAG" "bangumi-data/bangumi-data (tag $CURRENT_VER_TAG)" "--force"
+      log "tag $NEXT_VER_TAG 远端指向不同 commit ($remote_ref)，强制更新..."
+      git tag -f "$NEXT_VER_TAG" >/dev/null 2>&1
+      git_with_proxy push origin "refs/tags/$NEXT_VER_TAG" "bangumi-data/bangumi-data (tag $NEXT_VER_TAG)" "--force"
     else
-      log "tag $CURRENT_VER_TAG 远端已存在且相同，跳过。"
+      log "tag $NEXT_VER_TAG 远端已存在且相同，跳过。"
     fi
   else
-    log "无法读取当前版本号，跳过 tag 推送。"
+    log "NEXT_VER 为空，跳过 tag 推送。"
   fi
   log "bangumi-data 推送完成。"
 
