@@ -751,15 +751,15 @@ if [ "$DATA_COMMITTED" = "1" ]; then
     get_upstream_info
   fi
 
-  if [ -n "$CURRENT_VER" ] && [ -n "${PUBLISH_STATUS:-}" ]; then
+  if [ -n "$NEXT_VER" ] && [ -n "${PUBLISH_STATUS:-}" ]; then
     VERSION_SECTION="
 📦 **发布:**
-* 我们的版本: v${CURRENT_VER}
+* 我们的版本: v${NEXT_VER}
 * 上游版本: v${UPSTREAM_VER} (${UPSTREAM_TAG_DT_CST})
 * 状态: ${PUBLISH_STATUS}"
-  elif [ -n "$CURRENT_VER" ]; then
+  elif [ -n "$NEXT_VER" ]; then
     VERSION_SECTION="
-📦 **版本:** v${CURRENT_VER}
+📦 **版本:** v${NEXT_VER}
 * 基于上游: v${UPSTREAM_VER} (${UPSTREAM_TAG_DT_CST})"
   else
     VERSION_SECTION="
