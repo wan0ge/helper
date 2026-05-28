@@ -555,9 +555,12 @@ async function run() {
         const items = await getItems(filePath);
         const siteName = items[itemIdx].sites[siteIdx].site;
         failedSeasonId.push({ mediaId, site: siteName, filePath: path.relative(BANGUMI_DATA_DIR, filePath), reason });
-        recordFailure(skipList, 'bilibili', mediaId);
+        // HTTP 412 是临时风控，不计入 skip-list
+        if (!reason || !reason.includes('HTTP 412')) {
+          recordFailure(skipList, 'bilibili', mediaId);
+        }
       }
-      await delay(1000);  // 与原项目保持一致，避免 bilibili 风控
+      await delay(3000);  // 提高请求间隔，避免 bilibili 风控 412
     }
     console.log(`\n  season_id 补全完成：成功 ${doneSeasonId} / 失败 ${failSeasonId}`);
   }
@@ -586,9 +589,12 @@ async function run() {
         const items = await getItems(filePath);
         const siteName = items[itemIdx].sites[siteIdx].site;
         failedVideoSn.push({ gamerId, site: siteName, filePath: path.relative(BANGUMI_DATA_DIR, filePath), reason });
-        recordFailure(skipList, 'gamer', gamerId);
+        // HTTP 412 是临时风控，不计入 skip-list
+        if (!reason || !reason.includes('HTTP 412')) {
+          recordFailure(skipList, 'gamer', gamerId);
+        }
       }
-      await delay(1000);
+      await delay(3000);  // 提高请求间隔，避免 bilibili 风控 412
     }
     console.log(`\n  video_sn 补全完成：成功 ${doneVideoSn} / 失败 ${failVideoSn}`);
   }
@@ -626,7 +632,7 @@ async function run() {
         failRelated++;
         failedRelated.push({ mediaId, label, filePath: path.relative(BANGUMI_DATA_DIR, filePath), reason });
       }
-      await delay(1000);
+      await delay(3000);  // 提高请求间隔，避免 bilibili 风控 412
     }
     console.log(`\n  related 配音版本补全完成：成功 ${doneRelated} / 失败 ${failRelated}`);
   }

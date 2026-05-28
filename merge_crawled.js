@@ -174,12 +174,13 @@ async function merge() {
   if (relatedToFetch.length > 0) {
     console.log(`\n开始补全 related 配音版本 season_id（${relatedToFetch.length} 条）...`);
     const fileDirty = new Set();
+    const failedRelated = []; // { mediaId, label, filePath, reason }
 
     for (let idx = 0; idx < relatedToFetch.length; idx++) {
       const { filePath, itemIdx, siteIdx, mediaId, label } = relatedToFetch[idx];
-      process.stdout.write(`\r  进度: ${idx + 1}/${relatedToFetch.length}  成功: ${totalRelated}`);
+      process.stdout.write(`\r  进度: ${idx + 1}/${relatedToFetch.length}  成功: ${totalRelated}  失败: ${failedRelated.length}  `);
 
-      const { value: seasonId } = await fetchBilibiliSeasonId(mediaId);
+      const { value: seasonId, reason } = await fetchBilibiliSeasonId(mediaId);
       if (seasonId) {
         const items = fileCache[filePath];
         const site = items[itemIdx].sites[siteIdx];
@@ -197,15 +198,26 @@ async function merge() {
         fileDirty.add(filePath);
         totalRelated++;
         totalUpdated++;
+      } else {
+        failedRelated.push({ mediaId, label, filePath, reason });
       }
-      await delay(1000);
+      await delay(3000);  // 提高请求间隔，避免 bilibili 风控 412
     }
 
     // 写回修改的文件
     for (const filePath of fileDirty) {
       await fs.outputJson(filePath, fileCache[filePath], { spaces: 2 });
     }
-    console.log(`\n  related 配音版本补全完成：成功 ${totalRelated} / 共 ${relatedToFetch.length} 条`);
+    console.log(`\n  related 配音版本补全完成：成功 ${totalRelated} / 失败 ${failedRelated.length} / 共 ${relatedToFetch.length} 条`);
+
+    if (failedRelated.length > 0) {
+      console.log(`\n─── 失败的 related 配音版本（${failedRelated.length} 条）───`);
+      for (const { mediaId, label, filePath, reason } of failedRelated) {
+        const relPath = path.relative(BANGUMI_DATA_DIR, filePath);
+        console.log(`  [${label}] media_id=${mediaId}  文件: ${relPath}`);
+        console.log(`    原因: ${reason}`);
+      }
+    }
   } else {
     console.log('\n无需补全 related 配音版本。');
   }
