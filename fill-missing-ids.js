@@ -596,6 +596,7 @@ async function run() {
   // ── 补全 related（bilibili comment 中的配音版本 season_id）──────
 
   let doneRelated = 0, failRelated = 0;
+  const failedRelated = []; // { mediaId, label, filePath, reason }
   if (missingRelated.length > 0) {
     console.log(`\n开始补全 related 配音版本（${missingRelated.length} 条）...`);
     for (let idx = 0; idx < missingRelated.length; idx++) {
@@ -623,6 +624,7 @@ async function run() {
         doneRelated++;
       } else {
         failRelated++;
+        failedRelated.push({ mediaId, label, filePath: path.relative(BANGUMI_DATA_DIR, filePath), reason });
       }
       await delay(1000);
     }
@@ -672,6 +674,14 @@ async function run() {
     console.log(`\n─── 失败的 video_sn（${failedVideoSn.length} 条）───`);
     for (const { gamerId, site, filePath, reason } of failedVideoSn) {
       console.log(`  [${site}] id=${gamerId}  文件: ${filePath}`);
+      console.log(`    原因: ${reason}`);
+    }
+  }
+
+  if (failedRelated.length > 0) {
+    console.log(`\n─── 失败的 related 配音版本（${failedRelated.length} 条）───`);
+    for (const { mediaId, label, filePath, reason } of failedRelated) {
+      console.log(`  [${label}] media_id=${mediaId}  文件: ${filePath}`);
       console.log(`    原因: ${reason}`);
     }
   }
