@@ -126,6 +126,23 @@ function recordSuccess(skipList, type, id) {
   }
 }
 
+/**
+ * 从 bilibili site 的 comment 中提取配音版本 MD
+ * 正则匹配 "中配版: 28236257" / "粤配版: 28339619" 等
+ * @param {string} comment
+ * @returns {Array<{label: string, id: string}>}
+ */
+function parseCommentMDs(comment) {
+  if (!comment || typeof comment !== 'string') return [];
+  const re = /((?:普通[话話]|[国國][语語]|中文配音|中配|中文|[粤粵][语語]配音|[粤粵]配|[粤粵][语語]|[台臺]配|[台臺][语語]|港配|港[语語]|字幕|助[听聽]|日[语語]|日配|原版|原[声聲])(?:版)?)\s*:\s*(\d+)/g;
+  const result = [];
+  let m;
+  while ((m = re.exec(comment)) !== null) {
+    result.push({ label: m[1], id: m[2] });
+  }
+  return result;
+}
+
 // ─── API 工具 ──────────────────────────────────────────────────────────────
 
 /**
@@ -211,16 +228,18 @@ async function fetchGamerVideoSn(id, baseUrl) {
 function reorderSiteFields(site, newFields = {}) {
   const ordered = { site: site.site, id: site.id };
 
-  // 优先写 season_id 和 video_sn（新值覆盖旧值）
+  // 优先写 season_id、video_sn、related（新值覆盖旧值）
   const seasonId = newFields.season_id !== undefined ? newFields.season_id : site.season_id;
   const videoSn  = newFields.video_sn  !== undefined ? newFields.video_sn  : site.video_sn;
+  const related  = newFields.related   !== undefined ? newFields.related   : site.related;
 
   if (seasonId !== undefined) ordered.season_id = seasonId;
   if (videoSn  !== undefined) ordered.video_sn  = videoSn;
+  if (related  !== undefined && related.length > 0) ordered.related = related;
 
   // 复制其余字段（跳过已处理的）
   for (const key of Object.keys(site)) {
-    if (key !== 'site' && key !== 'id' && key !== 'season_id' && key !== 'video_sn') {
+    if (key !== 'site' && key !== 'id' && key !== 'season_id' && key !== 'video_sn' && key !== 'related') {
       ordered[key] = site[key];
     }
   }
@@ -409,6 +428,7 @@ async function run() {
 
   const missingSeasonId = []; // { filePath, itemIdx, siteIdx, mediaId }
   const missingVideoSn  = []; // { filePath, itemIdx, siteIdx, gamerId }
+  const missingRelated  = []; // { filePath, itemIdx, siteIdx, mediaId, label }
 
   let totalFiles = 0;
   for (const year of years.sort()) {
@@ -439,6 +459,17 @@ async function run() {
             }
             missingVideoSn.push({ filePath, itemIdx: i, siteIdx: j, gamerId: site.id });
           }
+
+          // 检查 bilibili comment 中的配音版本 MD（需要补全 related）
+          if ((site.site === 'bilibili' || site.site.startsWith('bilibili')) && site.comment) {
+            const refs = parseCommentMDs(site.comment);
+            for (const ref of refs) {
+              const existing = site.related ? site.related.find(r => r.id === ref.id) : null;
+              if (!existing || !existing.season_id) {
+                missingRelated.push({ filePath, itemIdx: i, siteIdx: j, mediaId: ref.id, label: ref.label });
+              }
+            }
+          }
         }
       }
     }
@@ -447,10 +478,11 @@ async function run() {
   // 过期的 skip 条目已由 isSkipped() 自动清除，刷新到磁盘
   await saveSkipList(skipList);
 
-  const totalMissing = missingSeasonId.length + missingVideoSn.length;
+  const totalMissing = missingSeasonId.length + missingVideoSn.length + missingRelated.length;
   console.log(`\n扫描完成：共 ${totalFiles} 个月份文件`);
   console.log(`  缺失 season_id：${missingSeasonId.length} 条`);
   console.log(`  缺失 video_sn：${missingVideoSn.length} 条`);
+  console.log(`  待补全 related（配音版本）：${missingRelated.length} 条`);
   if (skippedCount > 0) {
     console.log(`  跳过列表 (30天内连续失败${SKIP_FAILURE_THRESHOLD}次)：${skippedCount} 条`);
   }
@@ -464,7 +496,7 @@ async function run() {
     return;
   }
 
-  if (missingSeasonId.length === 0 && missingVideoSn.length === 0) {
+  if (missingSeasonId.length === 0 && missingVideoSn.length === 0 && missingRelated.length === 0) {
     console.log('\n所有条目已完整，无需补全。');
     return;
   }
@@ -561,6 +593,42 @@ async function run() {
     console.log(`\n  video_sn 补全完成：成功 ${doneVideoSn} / 失败 ${failVideoSn}`);
   }
 
+  // ── 补全 related（bilibili comment 中的配音版本 season_id）──────
+
+  let doneRelated = 0, failRelated = 0;
+  if (missingRelated.length > 0) {
+    console.log(`\n开始补全 related 配音版本（${missingRelated.length} 条）...`);
+    for (let idx = 0; idx < missingRelated.length; idx++) {
+      const { filePath, itemIdx, siteIdx, mediaId, label } = missingRelated[idx];
+      process.stdout.write(`\r  进度: ${idx + 1}/${missingRelated.length}  成功: ${doneRelated}  失败: ${failRelated}  `);
+
+      const { value: seasonId, reason } = await fetchBilibiliSeasonId(mediaId);
+      if (seasonId) {
+        const items = await getItems(filePath);
+        const site = items[itemIdx].sites[siteIdx];
+        let related = site.related || [];
+
+        // 去重：同 id 只保留一条
+        const existing = related.find(r => r.id === mediaId);
+        if (existing) {
+          existing.season_id = seasonId;
+          // 如果原来没有 label，补上
+          if (!existing.label) existing.label = label;
+        } else {
+          related.push({ id: mediaId, season_id: seasonId, label });
+        }
+
+        items[itemIdx].sites[siteIdx] = reorderSiteFields(site, { related });
+        fileDirty.add(filePath);
+        doneRelated++;
+      } else {
+        failRelated++;
+      }
+      await delay(1000);
+    }
+    console.log(`\n  related 配音版本补全完成：成功 ${doneRelated} / 失败 ${failRelated}`);
+  }
+
   // ── 写回文件 ───────────────────────────────────────────────────
 
   console.log(`\n写回文件（${fileDirty.size} 个文件修改）...`);
@@ -568,8 +636,8 @@ async function run() {
     await fs.outputJson(filePath, fileCache[filePath], { spaces: 2 });
   }
 
-  const totalDone = doneSeasonId + doneVideoSn;
-  const totalFail = failSeasonId + failVideoSn;
+  const totalDone = doneSeasonId + doneVideoSn + doneRelated;
+  const totalFail = failSeasonId + failVideoSn + failRelated;
   console.log(`\n✅ 全部完成！补全 ${totalDone} 条，无法获取 ${totalFail} 条`);
 
   // ── 请求耗时统计 ────────────────────────────────────────────────
@@ -635,6 +703,9 @@ async function run() {
       video_sn_total: missingVideoSn.length,
       video_sn_filled: doneVideoSn,
       video_sn_failed: failVideoSn,
+      related_total: missingRelated.length,
+      related_filled: doneRelated,
+      related_failed: failRelated,
       files_modified: fileDirty.size,
       gamer_url_label: gamerUrlLabel,
       skipped_count: skippedCount,
