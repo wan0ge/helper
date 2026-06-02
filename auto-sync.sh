@@ -473,6 +473,8 @@ fi
 
 # ── 同步 bangumi-data 上游 ────────────────────────────────────────────────────
 
+UPSTREAM_UPDATED=0  # 记录上游是否带来新提交（用于决定是否发布新版本）
+
 if [ "$FORCE" = "1" ]; then
   log "--force 模式：跳过上游同步，直接进行补全..."
 else
@@ -485,7 +487,18 @@ else
   cleanup_merge "$BANGUMI_DATA_DIR"
   git_with_proxy fetch upstream master "bangumi-data/bangumi-data"
   git checkout master --quiet 2>/dev/null || true
+
+  # 记录 fetch 前的 HEAD，用于判断上游是否有新内容
+  _before=$(git rev-parse HEAD 2>/dev/null || echo "")
   git merge upstream/master --no-edit -X ours || true
+  _after=$(git rev-parse HEAD 2>/dev/null || echo "")
+  if [ "$_before" != "$_after" ]; then
+    UPSTREAM_UPDATED=1
+    log "上游有新提交，将触发版本发布。"
+  else
+    log "上游无新提交。"
+  fi
+
   log "bangumi-data 同步完成。"
 fi
 
@@ -539,6 +552,13 @@ if git diff --quiet data/ && git diff --cached --quiet data/; then
     git add .gitignore
     git commit -m "test: 推送链路测试 [$(date '+%Y-%m-%d %H:%M:%S')]"
     DATA_COMMITTED=1
+  elif [ "$UPSTREAM_UPDATED" = "1" ]; then
+    # 上游有更新但补全后数据文件无变化：仍需一个提交以触发 GitHub Actions 发布
+    log "上游有更新，补全后数据文件无变化，创建触发提交以触发 GitHub Actions 发布..."
+    echo "# upstream-sync $(date '+%Y-%m-%d %H:%M:%S')" >> .gitignore
+    git add .gitignore
+    git commit -m "chore: 跟随上游更新 [$(date '+%Y-%m-%d')]"
+    DATA_COMMITTED=1
   else
     log "数据文件无变化，跳过提交。"
     DATA_COMMITTED=0
@@ -560,7 +580,10 @@ fi
 #     调用 get_upstream_info() 获取上游最新 tag 版本
 #     调用 calc_next_version() 计算：max(当前版+1, 上游版+1, 0.3.200)
 #
-if [ "$DO_PUBLISH" = "1" ] && [ "$DATA_COMMITTED" = "1" ]; then
+# 触发条件：上游有更新（UPSTREAM_UPDATED=1）或数据文件有补全提交（DATA_COMMITTED=1）
+#   只要上游发布了新版本，无论补全是否有新数据，都应该跟随发布新版本。
+#
+if [ "$DO_PUBLISH" = "1" ] && ([ "$UPSTREAM_UPDATED" = "1" ] || [ "$DATA_COMMITTED" = "1" ]); then
   if ! command -v npm >/dev/null 2>&1; then
     log "WARNING: npm 未安装，跳过发布。"
   else
