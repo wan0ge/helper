@@ -553,7 +553,50 @@ else
 
   # 记录 fetch 前的 HEAD，用于判断上游是否有新内容
   _before=$(git rev-parse HEAD 2>/dev/null || echo "")
-  git merge upstream/master --no-edit -X ours || true
+  git merge upstream/master --no-edit -X ours 2>/dev/null || true
+
+  # merge 失败后，检测并自动解决 modify/delete 冲突
+  #   DU = Deleted in ours,  Modified in theirs（我们删了、上游改了）
+  #        解决：git rm -f 保持删除，然后 git commit 完成合并
+  #   UD = Modified in ours,  Deleted in theirs（我们改了、上游删了）
+  #        解决：git checkout --ours 保持我们的版本，然后 git commit 完成合并
+  #   其他冲突（UU/AA等）→ 无法自动解决，reset 回退
+  if git ls-files --unmerged 2>/dev/null | grep -q .; then
+    log "检测到合并冲突，正在自动解决..."
+    UNMERGED_DU=$(git status --porcelain 2>/dev/null | grep '^DU ' | awk '{print $2}')
+    UNMERGED_UD=$(git status --porcelain 2>/dev/null | grep '^UD ' | awk '{print $2}')
+    CONFLICT_RESOLVED=0
+
+    # DU：我们删了、上游改了 → 保持删除
+    if [ -n "$UNMERGED_DU" ]; then
+      for f in $UNMERGED_DU; do
+        log "  冲突(DU) $f：我们已删除，上游有修改，保持删除"
+        git rm -f -- "$f" 2>/dev/null || true
+      done
+      CONFLICT_RESOLVED=1
+    fi
+
+    # UD：我们改了、上游删了 → 保持我们的版本
+    if [ -n "$UNMERGED_UD" ]; then
+      for f in $UNMERGED_UD; do
+        log "  冲突(UD) $f：上游已删除，我们仍有修改，保持我们的版本"
+        git checkout --ours -- "$f" 2>/dev/null || true
+        git add -- "$f" 2>/dev/null || true
+      done
+      CONFLICT_RESOLVED=1
+    fi
+
+    if [ "$CONFLICT_RESOLVED" = "1" ]; then
+      # 创建 merge commit 完成合并
+      git -c user.name="auto-sync" -c user.email="auto-sync@localhost" \
+        commit --no-edit 2>/dev/null || true
+      log "冲突已自动解决，合并完成。"
+    else
+      log "无法自动解决的冲突，重置到 HEAD..."
+      git reset --hard HEAD 2>/dev/null || true
+    fi
+  fi
+
   _after=$(git rev-parse HEAD 2>/dev/null || echo "")
   if [ "$_before" != "$_after" ]; then
     UPSTREAM_UPDATED=1
