@@ -626,11 +626,14 @@ fi
 if node "$HELPER_DIR/fill-missing-ids.js" --stats-file "$STATS_FILE"; then
   log "补全完成。"
 else
-  send_dingtalk_notification "补全任务失败" "❌ fill-missing-ids.js 执行失败
-
-时间: $(get_cst_time)
-来自：bangumi data"
-  die "fill-missing-ids.js 执行失败"
+  # 上游有更新时，即使补全失败也要继续发布（上游数据已有变化）
+  if [ "$UPSTREAM_UPDATED" = "1" ]; then
+    log "WARN: fill-missing-ids.js 失败，但上游有更新，继续创建触发提交..."
+    send_dingtalk_notification "补全任务失败（仍将继续发布）" "⚠️ fill-missing-ids.js 执行失败，但上游有更新，将继续发布新版本\n\n时间: $(get_cst_time)\n来自：bangumi data"
+  else
+    send_dingtalk_notification "补全任务失败" "❌ fill-missing-ids.js 执行失败\n\n时间: $(get_cst_time)\n来自：bangumi data"
+    die "fill-missing-ids.js 执行失败"
+  fi
 fi
 
 # ── 提交数据变更 ──────────────────────────────────────────────────────────────
