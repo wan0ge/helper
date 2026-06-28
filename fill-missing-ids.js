@@ -63,6 +63,15 @@ function pickRandom(arr, n) {
   return copy.slice(0, Math.min(n, copy.length));
 }
 
+/**
+ * 判断 reason 是否为网络层错误（地址不可达）
+ * 内容层失败（番剧未上架、下架等）不算网络错误
+ */
+function isNetworkError(reason) {
+  if (!reason) return false;
+  return reason.includes('网络错误') || reason.includes('ECONNREFUSED') || reason.includes('ENOTFOUND');
+}
+
 // ─── Skip List 持久化 ──────────────────────────────────────────────────────
 
 /** 加载 skip-list.json */
@@ -346,64 +355,71 @@ async function testConnectivity() {
   }
 
   console.log(`[gamer 原始地址] 随机选取 ${gamerSamples.length} 个条目测试：`);
-  let origPass = 0, origFail = 0;
+  let origPass = 0, origNetworkFail = 0;
   for (const entry of gamerSamples) {
     const res = await fetchGamerVideoSn(entry.id, GAMER_ORIGINAL_URL);
     if (res.value) {
       console.log(`  ✅ [${entry.site}] id=${entry.id}  →  video_sn=${res.value}  (${entry.title})`);
       origPass++;
-    } else {
+    } else if (isNetworkError(res.reason)) {
       console.log(`  ❌ [${entry.site}] id=${entry.id}  →  ${res.reason}  (${entry.title})`);
-      origFail++;
+      origNetworkFail++;
+    } else {
+      console.log(`  ⚠️  [${entry.site}] id=${entry.id}  →  ${res.reason}  (${entry.title})`);
     }
     await delay(1000);  // 反代可能有风控，与 bilibili 保持一致
   }
 
-  if (origPass === gamerSamples.length) {
-    console.log(`[gamer 原始地址] ✅ 全部通过 (${origPass}/${gamerSamples.length})`);
+  // 原始地址无网络错误：地址可达，内容层失败不代表地址不可用
+  if (origNetworkFail === 0) {
+    if (origPass === gamerSamples.length) {
+      console.log(`[gamer 原始地址] ✅ 全部通过 (${origPass}/${gamerSamples.length})`);
+    } else {
+      console.log(`[gamer 原始地址] ✅ 地址可达 (${origPass}/${gamerSamples.length} 有数据，其余为内容层无数据)`);
+    }
     console.log(`  将使用原始地址：${GAMER_ORIGINAL_URL}\n`);
     return result;
   }
 
-  // ── 原始地址不通，测试反代 ──
-  console.log(`[gamer 原始地址] ❌ 异常 (${origPass}/${gamerSamples.length} 通过)，切换到反代测试\n`);
+  // ── 原始地址有网络错误，测试反代 ──
+  console.log(`[gamer 原始地址] ⚠️  有网络错误 (${origNetworkFail}/${gamerSamples.length})，测试反代...\n`);
 
   console.log(`[gamer 反代地址] 测试相同 ${gamerSamples.length} 个条目：`);
-  let proxyPass = 0, proxyFail = 0;
+  let proxyPass = 0, proxyNetworkFail = 0;
   for (const entry of gamerSamples) {
     const res = await fetchGamerVideoSn(entry.id, GAMER_PROXY_URL);
     if (res.value) {
       console.log(`  ✅ [${entry.site}] id=${entry.id}  →  video_sn=${res.value}  (${entry.title})`);
       proxyPass++;
-    } else {
+    } else if (isNetworkError(res.reason)) {
       console.log(`  ❌ [${entry.site}] id=${entry.id}  →  ${res.reason}  (${entry.title})`);
-      proxyFail++;
+      proxyNetworkFail++;
+    } else {
+      console.log(`  ⚠️  [${entry.site}] id=${entry.id}  →  ${res.reason}  (${entry.title})`);
     }
     await delay(1000);  // 反代可能有风控，与 bilibili 保持一致
   }
 
-  if (proxyPass > origPass) {
-    // 反代优于原始（即使不完美），优先使用反代
-    if (proxyPass === gamerSamples.length) {
-      console.log(`[gamer 反代地址] ✅ 全部通过 (${proxyPass}/${gamerSamples.length})`);
+  // 比较网络错误数，默认使用反代
+  if (proxyNetworkFail < origNetworkFail) {
+    if (proxyNetworkFail === 0) {
+      console.log(`[gamer 反代地址] ✅ 无网络错误 (${proxyPass}/${gamerSamples.length} 有数据)`);
     } else {
-      console.log(`[gamer 反代地址] ⚠️  部分通过 (${proxyPass}/${gamerSamples.length})，但优于原始地址 (${origPass}/${gamerSamples.length})`);
+      console.log(`[gamer 反代地址] ⚠️  网络错误减少 (原始 ${origNetworkFail}/${gamerSamples.length}，反代 ${proxyNetworkFail}/${gamerSamples.length})`);
     }
     console.log(`  将使用反代地址：${GAMER_PROXY_URL}\n`);
     result.gamerUrl = GAMER_PROXY_URL;
     result.gamerUrlLabel = '反代地址';
-  } else if (origPass > proxyPass) {
-    console.log(`[gamer] ⚠️  原始地址优于反代（原始 ${origPass}/${gamerSamples.length}，反代 ${proxyPass}/${gamerSamples.length}）`);
-    console.log(`  将使用原始地址：${GAMER_ORIGINAL_URL}\n`);
   } else {
-    // 两者通过率相同
-    if (origPass === 0) {
-      console.log(`[gamer] ❌ 两个地址均不可用（原始 ${origPass}/${gamerSamples.length}，反代 ${proxyPass}/${gamerSamples.length}）`);
-      console.log(`  将使用原始地址重试：${GAMER_ORIGINAL_URL}\n`);
+    // 反代网络错误数相同或更多 → 默认使用反代
+    if (origNetworkFail > 0 && proxyNetworkFail > 0) {
+      console.log(`[gamer] ⚠️  两个地址均有网络错误（原始 ${origNetworkFail}/${gamerSamples.length}，反代 ${proxyNetworkFail}/${gamerSamples.length}），默认使用反代`);
     } else {
-      console.log(`[gamer] ✅ 通过率相同 (${origPass}/${gamerSamples.length})，使用原始地址`);
-      console.log(`  原始：${GAMER_ORIGINAL_URL}\n`);
+      console.log(`[gamer] ⚠️  反代网络错误数不低于原始地址（原始 ${origNetworkFail}/${gamerSamples.length}，反代 ${proxyNetworkFail}/${gamerSamples.length}），默认使用反代`);
     }
+    console.log(`  将使用反代地址：${GAMER_PROXY_URL}\n`);
+    result.gamerUrl = GAMER_PROXY_URL;
+    result.gamerUrlLabel = '反代地址';
   }
 
   return result;
