@@ -197,30 +197,26 @@ get_upstream_info() {
 
 # 计算下一个发布版本号
 #
-# 两种策略，由调用方通过 UPSTREAM_UPDATED 标志传入，区分以下场景：
+# 根据当前版本与上游版本的关系决定版本号策略：
 #
-#   strategy=major（上游有更新）：
-#     取当前版本的 major.minor.patch 三段基础部分（忽略尾缀），
-#     计算 max(基础部分+1, 上游版+1, 0.3.200) 作为下一版本。
-#     示例：cur=0.3.210-2, up=0.3.210 → 0.3.211
+#   当前基础版本领先上游（cur.base > up.base）→ 尾缀递增：
+#     保持大版本不变，追加或递增数字尾缀。
+#     示例：cur=0.3.213, up=0.3.212 → 0.3.213-1
+#           cur=0.3.213-1, up=0.3.212 → 0.3.213-2
 #
-#   strategy=minor（上游未更新，本地有补全提交）：
-#     当前基础版本 >= 上游版本时：对当前版本的数字尾缀加 1，若无尾缀则追加 -1。
-#     当前基础版本 < 上游版本时：对齐为 上游版+1（与 major 策略相同，无尾缀）。
-#     示例：cur=0.3.210, up=0.3.210 → 0.3.210-1
-#           cur=0.3.210-1, up=0.3.210 → 0.3.210-2
-#           cur=0.3.209, up=0.3.210 → 0.3.211（落后对齐）
+#   当前基础版本未领先上游（cur.base <= up.base）→ 对齐为上游+1：
+#     上游已追平或超过我们，提升大版本并重置尾缀。
+#     示例：cur=0.3.213-10, up=0.3.213 → 0.3.214
+#           cur=0.3.210, up=0.3.213 → 0.3.214
 #
-# 参数：$1=CUR_VER（当前版本字符串），$2=UP_VER（上游版本字符串），$3=strategy
+# 参数：$1=CUR_VER（当前版本字符串），$2=UP_VER（上游版本字符串）
 # 用环境变量传参，避免 bash 变量嵌进 JS 导致语法错误
 calc_next_version() {
   CUR_VER="$1"
   UP_VER="$2"
-  CALC_STRATEGY="$3"   # "major" | "minor"
   node -e "
-    const cur_raw  = process.env.CUR_VER;
-    const up_str   = process.env.UP_VER;
-    const strategy = process.env.CALC_STRATEGY;
+    const cur_raw = process.env.CUR_VER;
+    const up_str  = process.env.UP_VER;
 
     // 分离 major.minor.patch 基础部分和数字尾缀
     // 支持格式：0.3.210  /  0.3.210-1  /  0.3.210-test.3（test 版留给测试模式，正式流程不产生）
@@ -241,35 +237,20 @@ calc_next_version() {
       return 0;
     }
 
-    function joinBase(b) { return b.join('.'); }
-
     const cur = parseVer(cur_raw);
     const up  = parseVer(up_str);
     const base_min = [0, 3, 200];
 
     let result;
-
-    if (strategy === 'minor') {
-      // 小版本发布：当前基础版本 >= 上游版本时，使用尾缀递增模式。
-      // 当前基础版本已落后上游（cur.base < up.base），对齐为 max(上游+1, base_min)。
-      if (cmp(cur.base, up.base) >= 0) {
-        // 当前基础 >= 上游，使用尾缀模式
-        const next_suffix = (cur.suffix != null ? cur.suffix : 0) + 1;
-        result = joinBase(cur.base) + '-' + next_suffix;
-      } else {
-        // 当前基础落后上游，提升为上游+1（与 major 策略对齐，不带尾缀）
-        let align_next = [up.base[0], up.base[1], up.base[2] + 1];
-        if (cmp(base_min, align_next) > 0) align_next = base_min;
-        result = joinBase(align_next);
-      }
+    if (cmp(cur.base, up.base) > 0) {
+      // 当前基础版本领先上游：尾缀递增，保持大版本不变
+      const next_suffix = (cur.suffix != null ? cur.suffix : 0) + 1;
+      result = cur.base.join('.') + '-' + next_suffix;
     } else {
-      // major 策略：取基础部分，取 max(基础+1, 上游+1, base_min)
-      let next = [cur.base[0], cur.base[1], cur.base[2] + 1];
-      if (cmp([up.base[0], up.base[1], up.base[2] + 1], next) > 0)
-        next = [up.base[0], up.base[1], up.base[2] + 1];
-      if (cmp(base_min, next) > 0)
-        next = base_min;
-      result = joinBase(next);
+      // 当前基础版本未领先上游：对齐为上游+1，重置尾缀
+      let align_next = [up.base[0], up.base[1], up.base[2] + 1];
+      if (cmp(base_min, align_next) > 0) align_next = base_min;
+      result = align_next.join('.');
     }
 
     console.log(result);
@@ -587,7 +568,7 @@ else
   _after=$(git rev-parse HEAD 2>/dev/null || echo "")
   if [ "$_before" != "$_after" ]; then
     UPSTREAM_UPDATED=1
-    log "上游有新提交，将触发版本发布。"
+    log "上游有新提交，将创建触发提交。"
   else
     log "上游无新提交。"
   fi
@@ -672,16 +653,12 @@ fi
 #   测试模式 (--test-commit / --test-full)：
 #     使用 0.3.200-test.1, 0.3.200-test.2 ... 格式
 #     -test 后缀保证和正式版完全隔离，npm 不会冲突
-#   正式模式（strategy 根据 UPSTREAM_UPDATED 自动选择）：
-#     UPSTREAM_UPDATED=1（上游有更新）→ major 策略：
-#       不带尾缀，取 max(基础部分+1, 上游版+1, 0.3.200)
-#       示例：cur=0.3.210-2, up=0.3.210 → 0.3.211
-#     UPSTREAM_UPDATED=0（上游无更新，仅本地补全提交）→ minor 策略：
-#       对当前版本的数字尾缀加 1，若无尾缀则追加 -1
-#       示例：cur=0.3.210 → 0.3.210-1；cur=0.3.210-1 → 0.3.210-2
+#   正式模式：
+#     根据当前版本与上游版本的关系决定策略（详见 calc_next_version 函数注释）：
+#       当前基础版本领先上游 → 尾缀递增（如 0.3.213-1）
+#       当前基础版本未领先上游 → 对齐为上游+1（如 0.3.214）
 #
 # 触发条件：上游有更新（UPSTREAM_UPDATED=1）或数据文件有补全提交（DATA_COMMITTED=1）
-#   只要上游发布了新版本，无论补全是否有新数据，都应该跟随发布新版本。
 #
 if [ "$DO_PUBLISH" = "1" ] && ([ "$UPSTREAM_UPDATED" = "1" ] || [ "$DATA_COMMITTED" = "1" ]); then
   if ! command -v npm >/dev/null 2>&1; then
@@ -713,16 +690,10 @@ if [ "$DO_PUBLISH" = "1" ] && ([ "$UPSTREAM_UPDATED" = "1" ] || [ "$DATA_COMMITT
       NEXT_VER="${TEST_BASE}.${TEST_NUM}"
       log "测试模式：版本号 = $NEXT_VER (基于 0.3.200-test 序列)"
     else
-      # 正式模式：根据上游是否有更新选择 major/minor 策略
-      if [ "$UPSTREAM_UPDATED" = "1" ]; then
-        CALC_STRATEGY="major"
-        log "调用 calc_next_version（major 策略，上游有更新）..."
-      else
-        CALC_STRATEGY="minor"
-        log "调用 calc_next_version（minor 策略，上游无更新）..."
-      fi
-      NEXT_VER=$(calc_next_version "$CURRENT_VER" "$UPSTREAM_VER" "$CALC_STRATEGY")
-      log "正式模式：当前版=$CURRENT_VER, 上游版=$UPSTREAM_VER, 策略=$CALC_STRATEGY, 下一个版=$NEXT_VER"
+      # 正式模式：根据当前版本与上游版本的关系计算下一版本号
+      # 详见 calc_next_version 函数注释
+      NEXT_VER=$(calc_next_version "$CURRENT_VER" "$UPSTREAM_VER")
+      log "版本计算：当前版=$CURRENT_VER, 上游版=$UPSTREAM_VER, 下一个版=$NEXT_VER"
       log "上游 tag 时间: $UPSTREAM_TAG_DT_CST"
     fi
 
