@@ -145,9 +145,9 @@ get_cst_time() {
 # 输出到全局变量：UPSTREAM_VER, UPSTREAM_TAG_DT, UPSTREAM_TAG_DT_CST
 get_upstream_info() {
   # 通过 GitHub API 获取最新 tag（匿名，无 rate limit 问题）
-  # -m 10: 10秒超时，避免路由器上网络不通时无限等待
+  # 使用 curl_github 带代理回退，避免路由器上直连 api.github.com 不通
   local api_out
-  api_out=$(curl -s -m 10 "https://api.github.com/repos/bangumi-data/bangumi-data/tags?per_page=1" 2>/dev/null || echo "[]")
+  api_out=$(curl_github "https://api.github.com/repos/bangumi-data/bangumi-data/tags?per_page=1" 10 || echo "[]")
 
   # 解析 tag_name 和 commit 的 created_at
   # 用环境变量传参，避免 bash 变量嵌进 JS 字符串导致语法错误
@@ -167,9 +167,9 @@ get_upstream_info() {
   UPSTREAM_TAG_DT=""
   UPSTREAM_TAG_DT_CST=""
   if [ -n "$commit_url" ]; then
-    # 同样加超时
+    # 同样使用代理回退获取 commit 详情
     local commit_out
-    commit_out=$(curl -s -m 10 "$commit_url" 2>/dev/null || echo "{}")
+    commit_out=$(curl_github "$commit_url" 10 || echo "{}")
     UPSTREAM_TAG_DT=$(echo "$commit_out" | node -e "
       let d={};
       try { d=JSON.parse(require('fs').readFileSync('/dev/stdin','utf8').trim()||'{}'); } catch(e){}
@@ -183,9 +183,9 @@ get_upstream_info() {
     fi
   fi
 
-  # API 失败时回退用 ls-remote 只拿版本号
+  # API 失败时回退用 ls-remote 只拿版本号（带代理回退）
   if [ -z "$UPSTREAM_VER" ]; then
-    UPSTREAM_VER=$(git ls-remote --tags https://github.com/bangumi-data/bangumi-data.git 2>/dev/null \
+    UPSTREAM_VER=$(git_ls_remote_with_proxy --tags https://github.com/bangumi-data/bangumi-data.git \
       | grep -v '\^{}' | awk '{print $2}' \
       | sed 's|refs/tags/v||' | sort -V | tail -1)
   fi
@@ -447,6 +447,106 @@ git_with_proxy() {
   echo "$final_out" | sed 's/^/  | /' >&2
 
   echo "$LOG_PREFIX ERROR: $action ($repo_path) 所有代理和直连均不可用（错误详情见上方输出）" >&2
+  return 1
+}
+
+# GitHub HTTP API 请求（带代理回退）
+# 用法：curl_github <url> [timeout]
+# 尝试顺序与 git_with_proxy fetch 一致：gh-proxy 镜像 → HTTP 隧道代理 → 直连
+# 成功时输出响应到 stdout 并返回 0，失败返回 1
+curl_github() {
+  local url="$1"
+  local timeout="${2:-10}"
+  local out
+
+  # 1. gh-proxy 镜像（URL 重写，无需认证）
+  local OLD_IFS="$IFS"
+  IFS=','
+  for proxy in $GITHUB_PROXIES; do
+    IFS="$OLD_IFS"
+    if out=$(curl -s -m "$timeout" "${proxy}/${url}" 2>/dev/null) && [ -n "$out" ]; then
+      log "curl ($url) 通过代理 $proxy 成功"
+      echo "$out"
+      return 0
+    fi
+    IFS=','
+  done
+  IFS="$OLD_IFS"
+
+  # 2. HTTP 隧道代理（HTTP CONNECT，认证对代理透明）
+  if [ -n "$HTTP_PROXY_LIST" ]; then
+    OLD_IFS="$IFS"
+    IFS=','
+    for hp in $HTTP_PROXY_LIST; do
+      IFS="$OLD_IFS"
+      if out=$(curl -s -m "$timeout" --proxy "$hp" "$url" 2>/dev/null) && [ -n "$out" ]; then
+        log "curl ($url) 通过 HTTP 隧道代理 $hp 成功"
+        echo "$out"
+        return 0
+      fi
+      IFS=','
+    done
+    IFS="$OLD_IFS"
+  fi
+
+  # 3. 直连（最后尝试）
+  if out=$(curl -s -m "$timeout" "$url" 2>/dev/null) && [ -n "$out" ]; then
+    log "curl ($url) 直连成功"
+    echo "$out"
+    return 0
+  fi
+
+  log "curl ($url) 所有路径均失败"
+  return 1
+}
+
+# git ls-remote（带代理回退）
+# 用法：git_ls_remote_with_proxy <args...>（参数直接传递给 git ls-remote）
+# 尝试顺序与 git_with_proxy fetch 一致：gh-proxy 镜像 → HTTP 隧道代理 → 直连
+# 成功时输出结果到 stdout 并返回 0，失败返回 1
+git_ls_remote_with_proxy() {
+  local out
+
+  # 1. gh-proxy 镜像（URL 重写，无需认证）
+  local OLD_IFS="$IFS"
+  IFS=','
+  for proxy in $GITHUB_PROXIES; do
+    IFS="$OLD_IFS"
+    if out=$(GIT_TERMINAL_PROMPT=0 git -c "url.${proxy}/https://github.com/.insteadOf=https://github.com/" \
+          ls-remote "$@" 2>/dev/null); then
+      log "ls-remote 通过代理 $proxy 成功"
+      echo "$out"
+      return 0
+    fi
+    IFS=','
+  done
+  IFS="$OLD_IFS"
+
+  # 2. HTTP 隧道代理
+  if [ -n "$HTTP_PROXY_LIST" ]; then
+    OLD_IFS="$IFS"
+    IFS=','
+    for hp in $HTTP_PROXY_LIST; do
+      IFS="$OLD_IFS"
+      if out=$(GIT_TERMINAL_PROMPT=0 git -c "http.proxy=$hp" -c "http.sslVerify=false" \
+            ls-remote "$@" 2>/dev/null); then
+        log "ls-remote 通过 HTTP 隧道代理 $hp 成功"
+        echo "$out"
+        return 0
+      fi
+      IFS=','
+    done
+    IFS="$OLD_IFS"
+  fi
+
+  # 3. 直连（最后尝试）
+  if out=$(GIT_TERMINAL_PROMPT=0 git ls-remote "$@" 2>/dev/null); then
+    log "ls-remote 直连成功"
+    echo "$out"
+    return 0
+  fi
+
+  log "ls-remote 所有路径均失败"
   return 1
 }
 
@@ -767,7 +867,7 @@ if [ "$DATA_COMMITTED" = "1" ] || [ "$FORCE_PUSH" = "1" ]; then
   log "推送 bangumi-data tags..."
   NEXT_VER_TAG="v$NEXT_VER"
   if [ -n "$NEXT_VER_TAG" ] && [ "$NEXT_VER_TAG" != "v" ]; then
-    remote_ref="$(git ls-remote --tags origin "refs/tags/$NEXT_VER_TAG" 2>/dev/null | awk '{print $1}')"
+    remote_ref="$(git_ls_remote_with_proxy --tags origin "refs/tags/$NEXT_VER_TAG" | awk '{print $1}')"
     local_ref="$(git rev-parse "$NEXT_VER_TAG" 2>/dev/null)"
     if [ -z "$remote_ref" ]; then
       log "tag $NEXT_VER_TAG 远端不存在，创建..."
