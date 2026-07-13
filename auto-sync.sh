@@ -816,7 +816,7 @@ if [ "$DO_PUBLISH" = "1" ] && ([ "$UPSTREAM_UPDATED" = "1" ] || [ "$DATA_COMMITT
     log "git tag v$NEXT_VER 完成"
 
     log "开始 npm publish..."
-    if npm publish --access public 2>&1; then
+    if npm publish --access public --tag latest 2>&1; then
       log "已发布 @wan0ge/bangumi-data@$NEXT_VER"
       PUBLISH_STATUS="✅ 已发布 v$NEXT_VER"
     else
