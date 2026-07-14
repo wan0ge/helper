@@ -197,17 +197,16 @@ get_upstream_info() {
 
 # 计算下一个发布版本号
 #
-# 根据当前版本与上游版本的关系决定版本号策略：
+# 根据当前版本与上游版本的关系决定版本号策略（patch 递增）：
 #
-#   当前基础版本领先上游（cur.base > up.base）→ 尾缀递增：
-#     保持大版本不变，追加或递增数字尾缀。
-#     示例：cur=0.3.213, up=0.3.212 → 0.3.213-1
-#           cur=0.3.213-1, up=0.3.212 → 0.3.213-2
+#   我们领先或平齐上游（cur >= up）→ patch 递增：
+#     在当前大版本基础上 patch+1。
+#     示例：cur=0.3.214-1, up=0.3.213 → 0.3.215
+#           cur=0.3.214,   up=0.3.213 → 0.3.215
 #
-#   当前基础版本未领先上游（cur.base <= up.base）→ 对齐为上游+1：
-#     上游已追平或超过我们，提升大版本并重置尾缀。
-#     示例：cur=0.3.213-10, up=0.3.213 → 0.3.214
-#           cur=0.3.210, up=0.3.213 → 0.3.214
+#   上游领先我们（cur < up）→ 对齐上游+1：
+#     紧跟上一步发布的版本。
+#     示例：cur=0.3.214, up=0.3.216 → 0.3.217
 #
 # 参数：$1=CUR_VER（当前版本字符串），$2=UP_VER（上游版本字符串）
 # 用环境变量传参，避免 bash 变量嵌进 JS 导致语法错误
@@ -218,15 +217,10 @@ calc_next_version() {
     const cur_raw = process.env.CUR_VER;
     const up_str  = process.env.UP_VER;
 
-    // 分离 major.minor.patch 基础部分和数字尾缀
-    // 支持格式：0.3.210  /  0.3.210-1  /  0.3.210-test.3（test 版留给测试模式，正式流程不产生）
     function parseVer(s) {
-      const m = String(s || '').match(/^(\d+)\.(\d+)\.(\d+)(?:-(\d+))?/);
-      if (!m) return { base: [0,3,200], suffix: null };
-      return {
-        base: [Number(m[1]), Number(m[2]), Number(m[3])],
-        suffix: m[4] != null ? Number(m[4]) : null,
-      };
+      const m = String(s || '').match(/^(\d+)\.(\d+)\.(\d+)/);
+      if (!m) return [0, 3, 200];
+      return [Number(m[1]), Number(m[2]), Number(m[3])];
     }
 
     function cmp(a, b) {
@@ -239,21 +233,17 @@ calc_next_version() {
 
     const cur = parseVer(cur_raw);
     const up  = parseVer(up_str);
-    const base_min = [0, 3, 200];
 
-    let result;
-    if (cmp(cur.base, up.base) > 0) {
-      // 当前基础版本领先上游：尾缀递增，保持大版本不变
-      const next_suffix = (cur.suffix != null ? cur.suffix : 0) + 1;
-      result = cur.base.join('.') + '-' + next_suffix;
+    let next;
+    if (cmp(cur, up) >= 0) {
+      // 我们领先或平齐上游：在当前基础上 patch+1
+      next = [cur[0], cur[1], cur[2] + 1];
     } else {
-      // 当前基础版本未领先上游：对齐为上游+1，重置尾缀
-      let align_next = [up.base[0], up.base[1], up.base[2] + 1];
-      if (cmp(base_min, align_next) > 0) align_next = base_min;
-      result = align_next.join('.');
+      // 上游领先我们：对齐上游+1
+      next = [up[0], up[1], up[2] + 1];
     }
 
-    console.log(result);
+    console.log(next.join('.'));
   " 2>/dev/null || echo "0.3.200"
 }
 
@@ -755,8 +745,8 @@ fi
 #     -test 后缀保证和正式版完全隔离，npm 不会冲突
 #   正式模式：
 #     根据当前版本与上游版本的关系决定策略（详见 calc_next_version 函数注释）：
-#       当前基础版本领先上游 → 尾缀递增（如 0.3.213-1）
-#       当前基础版本未领先上游 → 对齐为上游+1（如 0.3.214）
+#       我们领先或平齐上游 → patch 递增（如 0.3.214 → 0.3.215）
+#       上游领先我们 → 对齐上游+1（如 0.3.217）
 #
 # 触发条件：上游有更新（UPSTREAM_UPDATED=1）或数据文件有补全提交（DATA_COMMITTED=1）
 #
