@@ -28,9 +28,22 @@ const BANGUMI_DATA_DIR = path.resolve(__dirname, '../bangumi-data/data/items');
 const SITE_SEASON_ID = new Set(['bilibili', 'bilibili_hk_mo_tw', 'bilibili_tw', 'bilibili_hk_mo']);
 const SITE_VIDEO_SN  = new Set(['gamer', 'gamer_hk']);
 
-// gamer 反代地址（备选，应对网络问题）
+// gamer 详情页地址（HTML 抓取首集 video_sn）
 const GAMER_ORIGINAL_URL = 'https://acg.gamer.com.tw/acgDetail.php?s=';
 const GAMER_PROXY_URL    = 'https://elegy233.netlify.app/bahamutAcg/acgDetail.php?s=';
+
+// gamer 搜索 API 地址（通过标题搜索获取 video_sn，搜索结果直接包含 video_sn）
+const GAMER_SEARCH_DIRECT_URL = 'https://api.gamer.com.tw/mobile_app/anime/v1/search.php?kw=';
+const GAMER_SEARCH_PROXY_URL  = 'https://bahamuts233.netlify.app/bahamut/mobile_app/anime/v1/search.php?kw=';
+
+// gamer 请求间隔（毫秒），应对风控
+const GAMER_DELAY_MS = 5000;
+
+// 搜索 API 请求头（模拟巴哈姆特动画 App，API 要求移动端 UA）
+const GAMER_SEARCH_HEADERS = {
+  'Content-Type': 'application/json',
+  'User-Agent': 'Anime/2.29.2 (7N5749MM3F.tw.com.gamer.anime; build:972; iOS 26.0.0) Alamofire/5.6.4',
+};
 
 // skip-list 持久化路径：记录连续失败的条目，达到阈值后跳过 30 天
 const SKIP_LIST_PATH = path.resolve(__dirname, 'skip-list.json');
@@ -70,6 +83,15 @@ function pickRandom(arr, n) {
 function isNetworkError(reason) {
   if (!reason) return false;
   return reason.includes('网络错误') || reason.includes('ECONNREFUSED') || reason.includes('ENOTFOUND');
+}
+
+/**
+ * 判断 reason 是否为 HTTP 错误（服务端返回非 2xx 状态码）
+ * 如 HTTP 403 Forbidden、HTTP 429 Too Many Requests 等
+ */
+function isHttpError(reason) {
+  if (!reason) return false;
+  return /^HTTP \d{3}/.test(reason);
 }
 
 // ─── Skip List 持久化 ──────────────────────────────────────────────────────
@@ -221,11 +243,134 @@ async function fetchGamerVideoSn(id, baseUrl) {
     } catch (e) {
       lastError = e;
       if (attempt < MAX_RETRIES) {
-        await delay(2000);  // 重试前等待 2 秒
+        await delay(GAMER_DELAY_MS);  // gamer 请求间隔
       }
     }
   }
   return { value: null, elapsed: Date.now() - t0, reason: `网络错误(重试${MAX_RETRIES}次后失败): ${lastError.message}` };
+}
+
+/**
+ * 将标题按标点分割取前半段，用于搜索降级
+ * 示例："骸骨騎士様、只今異世界へお出掛け中Ⅱ" → "骸骨騎士様、只今"
+ *
+ * @param {string} title - 原始标题
+ * @returns {string|null} 切半后的标题，无法切分时返回 null
+ */
+function halfCutTitle(title) {
+  if (!title || title.length < 4) return null;
+
+  // 按常见分隔符分割，取分隔符后 2 个字符确保搜索词有足够区分度
+  const delimiters = ['、', '，', ',', '。', '・', '：', ':', '～', '~'];
+  for (const delim of delimiters) {
+    const idx = title.indexOf(delim);
+    if (idx > 0 && idx < title.length - 3) {
+      return title.substring(0, Math.min(idx + 3, title.length));
+    }
+  }
+
+  // 无标点时按半长度切分
+  const mid = Math.floor(title.length / 2);
+  if (mid >= 2) return title.substring(0, mid);
+
+  return null;
+}
+
+/**
+ * 从 bangumi-data 条目中提取搜索词候选列表
+ * 优先级：繁体中文 > 日语原名 > 简体中文 > 日语原名切半
+ *
+ * @param {object} item - bangumi-data 条目（含 title 和 titleTranslate）
+ * @returns {string[]} 搜索词候选列表（已去重）
+ */
+function getSearchCandidates(item) {
+  const candidates = [];
+  const seen = new Set();
+
+  function add(candidate) {
+    if (candidate && !seen.has(candidate)) {
+      seen.add(candidate);
+      candidates.push(candidate);
+    }
+  }
+
+  // 繁体中文翻译
+  const zhHant = item.titleTranslate?.['zh-Hant'];
+  if (Array.isArray(zhHant) && zhHant.length > 0) {
+    add(zhHant[0]);
+  }
+
+  // 日语原名
+  add(item.title);
+
+  // 简体中文翻译
+  const zhHans = item.titleTranslate?.['zh-Hans'];
+  if (Array.isArray(zhHans) && zhHans.length > 0) {
+    add(zhHans[0]);
+  }
+
+  // 日语原名切半（搜索降级）
+  add(halfCutTitle(item.title));
+
+  return candidates;
+}
+
+/**
+ * 通过搜索 API 按标题查询 video_sn
+ * 搜索结果中包含 acg_sn，与本地 gamer id 对照确认后提取 video_sn
+ *
+ * 搜索词优先级见 getSearchCandidates，逐个尝试直到匹配成功
+ *
+ * @param {object} item - bangumi-data 条目（含 title 和 titleTranslate）
+ * @param {string} gamerId - 本地 gamer site 的 id（对应 API 的 acg_sn）
+ * @param {string} searchBaseUrl - 搜索 API 基础 URL（直连或反代）
+ * @returns {{ value: string|null, elapsed: number, reason: string }}
+ */
+async function fetchGamerVideoSnViaSearch(item, gamerId, searchBaseUrl) {
+  const candidates = getSearchCandidates(item);
+  const t0 = Date.now();
+  let lastReason = null;
+
+  for (const keyword of candidates) {
+    const encodedKw = encodeURIComponent(keyword);
+    const url = `${searchBaseUrl}${encodedKw}`;
+    let lastError = null;
+    let apiResponded = false;
+
+    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+      try {
+        const res = await fetch(url, { headers: GAMER_SEARCH_HEADERS });
+        if (!res.ok) {
+          // HTTP 错误（如 403），端点被阻断，后续搜索词同样无法访问
+          return { value: null, elapsed: Date.now() - t0, reason: `HTTP ${res.status} ${res.statusText}` };
+        }
+        const json = await res.json();
+        const animeList = json?.data?.anime || json?.anime || [];
+
+        const match = animeList.find(a => String(a.acg_sn) === String(gamerId));
+        if (match && match.video_sn) {
+          return { value: String(match.video_sn), elapsed: Date.now() - t0, reason: null };
+        }
+        // API 返回成功但未匹配 acg_sn，尝试下一个搜索词
+        apiResponded = true;
+        lastReason = `搜索"${keyword}"未找到 acg_sn=${gamerId}`;
+        break;
+      } catch (e) {
+        lastError = e;
+        if (attempt < MAX_RETRIES) {
+          await delay(GAMER_DELAY_MS);
+        }
+      }
+    }
+
+    if (!apiResponded && lastError) {
+      return { value: null, elapsed: Date.now() - t0, reason: `网络错误(重试${MAX_RETRIES}次后失败): ${lastError.message}` };
+    }
+
+    await delay(GAMER_DELAY_MS);
+  }
+
+  return { value: null, elapsed: Date.now() - t0, reason: lastReason || `搜索API未找到 acg_sn=${gamerId} 的条目` };
 }
 
 // ─── 字段排序 ──────────────────────────────────────────────────────────────
@@ -302,14 +447,29 @@ async function findLatestSampleEntries(siteSet, count) {
 
 /**
  * 连通性测试：随机测试几个条目确认网络正常
- * @returns {{ bilibiliOk: boolean, gamerUrl: string|null, gamerUrlLabel: string }}
+ *
+ * 测试链路（级联）：
+ *   1. gamer 详情抓取：原始地址 → 反代地址
+ *   2. gamer 搜索API：直连 → 反代
+ *   3. 策略决策：详情抓取可用时优先使用（直接 ID 查询），
+ *      否则使用搜索API（标题搜索），两者均不可用时默认详情抓取
+ *
+ * @returns {{ bilibiliOk: boolean, gamerUrl: string, gamerUrlLabel: string,
+ *            searchApiUrl: string, searchApiLabel: string, gamerStrategy: string }}
  */
 async function testConnectivity() {
   console.log('──────────────────────────────────────────');
   console.log('🔍 网络连通性测试');
   console.log('──────────────────────────────────────────\n');
 
-  const result = { bilibiliOk: true, gamerUrl: GAMER_ORIGINAL_URL, gamerUrlLabel: '原始地址' };
+  const result = {
+    bilibiliOk: true,
+    gamerUrl: GAMER_ORIGINAL_URL,
+    gamerUrlLabel: '原始地址',
+    searchApiUrl: GAMER_SEARCH_DIRECT_URL,
+    searchApiLabel: '直连',
+    gamerStrategy: 'detail',
+  };
 
   // ── 测试 bilibili ──
   const biliEntries = await findLatestSampleEntries(
@@ -333,7 +493,7 @@ async function testConnectivity() {
         console.log(`  ❌ [${entry.site}] media_id=${entry.id}  →  ${res.reason}  (${entry.title})`);
         biliFail++;
       }
-      await delay(1000);  // 与原项目保持一致，避免 bilibili 风控
+      await delay(1000);  // bilibili 风控间隔
     }
 
     if (biliPass === biliSamples.length) {
@@ -345,7 +505,7 @@ async function testConnectivity() {
     }
   }
 
-  // ── 测试 gamer 原始地址 ──
+  // ── 测试 gamer 详情抓取（原始地址） ──
   const gamerEntries = await findLatestSampleEntries(SITE_VIDEO_SN, 2);
   const gamerSamples = pickRandom(gamerEntries, 2);
 
@@ -354,8 +514,8 @@ async function testConnectivity() {
     return result;
   }
 
-  console.log(`[gamer 原始地址] 随机选取 ${gamerSamples.length} 个条目测试：`);
-  let origPass = 0, origNetworkFail = 0;
+  console.log(`[gamer 详情抓取 原始地址] 随机选取 ${gamerSamples.length} 个条目测试：`);
+  let origPass = 0, origNetworkFail = 0, origHttpFail = 0;
   for (const entry of gamerSamples) {
     const res = await fetchGamerVideoSn(entry.id, GAMER_ORIGINAL_URL);
     if (res.value) {
@@ -364,62 +524,141 @@ async function testConnectivity() {
     } else if (isNetworkError(res.reason)) {
       console.log(`  ❌ [${entry.site}] id=${entry.id}  →  ${res.reason}  (${entry.title})`);
       origNetworkFail++;
+    } else if (isHttpError(res.reason)) {
+      console.log(`  ❌ [${entry.site}] id=${entry.id}  →  ${res.reason}  (${entry.title})`);
+      origHttpFail++;
     } else {
       console.log(`  ⚠️  [${entry.site}] id=${entry.id}  →  ${res.reason}  (${entry.title})`);
     }
-    await delay(1000);  // 反代可能有风控，与 bilibili 保持一致
+    await delay(GAMER_DELAY_MS);
   }
 
-  // 原始地址无网络错误：地址可达，内容层失败不代表地址不可用
-  if (origNetworkFail === 0) {
+  // 详情抓取可用性：无网络错误且无 HTTP 错误（内容层失败不代表地址不可用）
+  let detailWorks = (origNetworkFail === 0 && origHttpFail === 0);
+
+  if (detailWorks) {
     if (origPass === gamerSamples.length) {
-      console.log(`[gamer 原始地址] ✅ 全部通过 (${origPass}/${gamerSamples.length})`);
+      console.log(`[gamer 详情抓取 原始地址] ✅ 全部通过 (${origPass}/${gamerSamples.length})`);
     } else {
-      console.log(`[gamer 原始地址] ✅ 地址可达 (${origPass}/${gamerSamples.length} 有数据，其余为内容层无数据)`);
+      console.log(`[gamer 详情抓取 原始地址] ✅ 地址可达 (${origPass}/${gamerSamples.length} 有数据，其余为内容层无数据)`);
     }
     console.log(`  将使用原始地址：${GAMER_ORIGINAL_URL}\n`);
-    return result;
-  }
-
-  // ── 原始地址有网络错误，测试反代 ──
-  console.log(`[gamer 原始地址] ⚠️  有网络错误 (${origNetworkFail}/${gamerSamples.length})，测试反代...\n`);
-
-  console.log(`[gamer 反代地址] 测试相同 ${gamerSamples.length} 个条目：`);
-  let proxyPass = 0, proxyNetworkFail = 0;
-  for (const entry of gamerSamples) {
-    const res = await fetchGamerVideoSn(entry.id, GAMER_PROXY_URL);
-    if (res.value) {
-      console.log(`  ✅ [${entry.site}] id=${entry.id}  →  video_sn=${res.value}  (${entry.title})`);
-      proxyPass++;
-    } else if (isNetworkError(res.reason)) {
-      console.log(`  ❌ [${entry.site}] id=${entry.id}  →  ${res.reason}  (${entry.title})`);
-      proxyNetworkFail++;
-    } else {
-      console.log(`  ⚠️  [${entry.site}] id=${entry.id}  →  ${res.reason}  (${entry.title})`);
-    }
-    await delay(1000);  // 反代可能有风控，与 bilibili 保持一致
-  }
-
-  // 比较网络错误数，默认使用反代
-  if (proxyNetworkFail < origNetworkFail) {
-    if (proxyNetworkFail === 0) {
-      console.log(`[gamer 反代地址] ✅ 无网络错误 (${proxyPass}/${gamerSamples.length} 有数据)`);
-    } else {
-      console.log(`[gamer 反代地址] ⚠️  网络错误减少 (原始 ${origNetworkFail}/${gamerSamples.length}，反代 ${proxyNetworkFail}/${gamerSamples.length})`);
-    }
-    console.log(`  将使用反代地址：${GAMER_PROXY_URL}\n`);
-    result.gamerUrl = GAMER_PROXY_URL;
-    result.gamerUrlLabel = '反代地址';
+    result.gamerUrl = GAMER_ORIGINAL_URL;
+    result.gamerUrlLabel = '原始地址';
   } else {
-    // 反代网络错误数相同或更多 → 默认使用反代
-    if (origNetworkFail > 0 && proxyNetworkFail > 0) {
-      console.log(`[gamer] ⚠️  两个地址均有网络错误（原始 ${origNetworkFail}/${gamerSamples.length}，反代 ${proxyNetworkFail}/${gamerSamples.length}），默认使用反代`);
+    // 原始地址有网络错误或 HTTP 错误，测试反代
+    const failSummary = `网络${origNetworkFail}/${gamerSamples.length} HTTP${origHttpFail}/${gamerSamples.length}`;
+    console.log(`[gamer 详情抓取 原始地址] ⚠️  不可用 (${failSummary})，测试反代...\n`);
+
+    console.log(`[gamer 详情抓取 反代地址] 测试相同 ${gamerSamples.length} 个条目：`);
+    let proxyPass = 0, proxyNetworkFail = 0, proxyHttpFail = 0;
+    for (const entry of gamerSamples) {
+      const res = await fetchGamerVideoSn(entry.id, GAMER_PROXY_URL);
+      if (res.value) {
+        console.log(`  ✅ [${entry.site}] id=${entry.id}  →  video_sn=${res.value}  (${entry.title})`);
+        proxyPass++;
+      } else if (isNetworkError(res.reason)) {
+        console.log(`  ❌ [${entry.site}] id=${entry.id}  →  ${res.reason}  (${entry.title})`);
+        proxyNetworkFail++;
+      } else if (isHttpError(res.reason)) {
+        console.log(`  ❌ [${entry.site}] id=${entry.id}  →  ${res.reason}  (${entry.title})`);
+        proxyHttpFail++;
+      } else {
+        console.log(`  ⚠️  [${entry.site}] id=${entry.id}  →  ${res.reason}  (${entry.title})`);
+      }
+      await delay(GAMER_DELAY_MS);
+    }
+
+    detailWorks = (proxyNetworkFail === 0 && proxyHttpFail === 0);
+
+    if (detailWorks) {
+      if (proxyPass === gamerSamples.length) {
+        console.log(`[gamer 详情抓取 反代地址] ✅ 全部通过 (${proxyPass}/${gamerSamples.length})`);
+      } else {
+        console.log(`[gamer 详情抓取 反代地址] ✅ 地址可达 (${proxyPass}/${gamerSamples.length} 有数据，其余为内容层无数据)`);
+      }
     } else {
-      console.log(`[gamer] ⚠️  反代网络错误数不低于原始地址（原始 ${origNetworkFail}/${gamerSamples.length}，反代 ${proxyNetworkFail}/${gamerSamples.length}），默认使用反代`);
+      const failSummary = `网络${proxyNetworkFail}/${gamerSamples.length} HTTP${proxyHttpFail}/${gamerSamples.length}`;
+      console.log(`[gamer 详情抓取 反代地址] ⚠️  不可用 (${failSummary})`);
     }
     console.log(`  将使用反代地址：${GAMER_PROXY_URL}\n`);
     result.gamerUrl = GAMER_PROXY_URL;
     result.gamerUrlLabel = '反代地址';
+  }
+
+  // ── 测试 gamer 搜索 API（直连） ──
+  console.log(`[gamer 搜索API 直连] 测试 ${gamerSamples.length} 个条目：`);
+  let searchDirectOk = 0, searchDirectFail = 0;
+  for (const entry of gamerSamples) {
+    const encodedKw = encodeURIComponent(entry.title);
+    const url = `${GAMER_SEARCH_DIRECT_URL}${encodedKw}`;
+    try {
+      const res = await fetch(url, { headers: GAMER_SEARCH_HEADERS });
+      if (res.ok) {
+        console.log(`  ✅ [${entry.site}] id=${entry.id}  →  HTTP ${res.status}  (${entry.title})`);
+        searchDirectOk++;
+      } else {
+        console.log(`  ❌ [${entry.site}] id=${entry.id}  →  HTTP ${res.status}  (${entry.title})`);
+        searchDirectFail++;
+      }
+    } catch (e) {
+      console.log(`  ❌ [${entry.site}] id=${entry.id}  →  网络错误: ${e.message}  (${entry.title})`);
+      searchDirectFail++;
+    }
+    await delay(GAMER_DELAY_MS);
+  }
+
+  let searchWorks = false;
+  if (searchDirectOk > 0) {
+    console.log(`[gamer 搜索API 直连] ✅ 可用 (${searchDirectOk}/${gamerSamples.length} 成功)`);
+    result.searchApiUrl = GAMER_SEARCH_DIRECT_URL;
+    result.searchApiLabel = '直连';
+    searchWorks = true;
+  } else {
+    // 直连不可用，测试反代
+    console.log(`[gamer 搜索API 直连] ❌ 不可用，测试反代...\n`);
+    console.log(`[gamer 搜索API 反代] 测试 ${gamerSamples.length} 个条目：`);
+    let searchProxyOk = 0, searchProxyFail = 0;
+    for (const entry of gamerSamples) {
+      const encodedKw = encodeURIComponent(entry.title);
+      const url = `${GAMER_SEARCH_PROXY_URL}${encodedKw}`;
+      try {
+        const res = await fetch(url, { headers: GAMER_SEARCH_HEADERS });
+        if (res.ok) {
+          console.log(`  ✅ [${entry.site}] id=${entry.id}  →  HTTP ${res.status}  (${entry.title})`);
+          searchProxyOk++;
+        } else {
+          console.log(`  ❌ [${entry.site}] id=${entry.id}  →  HTTP ${res.status}  (${entry.title})`);
+          searchProxyFail++;
+        }
+      } catch (e) {
+        console.log(`  ❌ [${entry.site}] id=${entry.id}  →  网络错误: ${e.message}  (${entry.title})`);
+        searchProxyFail++;
+      }
+      await delay(GAMER_DELAY_MS);
+    }
+
+    result.searchApiUrl = GAMER_SEARCH_PROXY_URL;
+    result.searchApiLabel = '反代';
+    if (searchProxyOk > 0) {
+      console.log(`[gamer 搜索API 反代] ✅ 可用 (${searchProxyOk}/${gamerSamples.length} 成功)`);
+      searchWorks = true;
+    } else {
+      console.log(`[gamer 搜索API 反代] ❌ 不可用 (${searchProxyOk}/${gamerSamples.length} 成功)`);
+      searchWorks = false;
+    }
+  }
+
+  // ── 策略决策 ──
+  if (detailWorks) {
+    result.gamerStrategy = 'detail';
+    console.log(`\n[gamer 策略] 详情抓取 (${result.gamerUrlLabel})\n`);
+  } else if (searchWorks) {
+    result.gamerStrategy = 'search';
+    console.log(`\n[gamer 策略] 搜索API (${result.searchApiLabel})\n`);
+  } else {
+    result.gamerStrategy = 'detail';
+    console.log(`\n[gamer 策略] 详情抓取和搜索API均不可用，默认详情抓取 (${result.gamerUrlLabel})\n`);
   }
 
   return result;
@@ -521,11 +760,17 @@ async function run() {
 
   let gamerUrl = GAMER_ORIGINAL_URL;
   let gamerUrlLabel = '原始地址';
+  let searchApiUrl = GAMER_SEARCH_DIRECT_URL;
+  let searchApiLabel = '直连';
+  let gamerStrategy = 'detail';
 
   if (!SKIP_TEST) {
     const testResult = await testConnectivity();
     gamerUrl = testResult.gamerUrl;
     gamerUrlLabel = testResult.gamerUrlLabel;
+    searchApiUrl = testResult.searchApiUrl;
+    searchApiLabel = testResult.searchApiLabel;
+    gamerStrategy = testResult.gamerStrategy;
   } else {
     console.log('⏭️  跳过网络连通性测试（--skip-test）\n');
   }
@@ -545,7 +790,11 @@ async function run() {
   console.log('──────────────────────────────────────────');
   console.log('🚀 开始补全');
   console.log('──────────────────────────────────────────');
-  console.log(`  gamer 使用: ${gamerUrlLabel} (${gamerUrl})`);
+  if (gamerStrategy === 'search') {
+    console.log(`  gamer 策略: 搜索API (${searchApiLabel}: ${searchApiUrl})`);
+  } else {
+    console.log(`  gamer 策略: 详情抓取 (${gamerUrlLabel}: ${gamerUrl})`);
+  }
 
   // ── 补全 season_id ─────────────────────────────────────────────
 
@@ -592,7 +841,15 @@ async function run() {
       const { filePath, itemIdx, siteIdx, gamerId } = missingVideoSn[idx];
       process.stdout.write(`\r  进度: ${idx + 1}/${missingVideoSn.length}  成功: ${doneVideoSn}  失败: ${failVideoSn}  `);
 
-      const { value: videoSn, elapsed, reason } = await fetchGamerVideoSn(gamerId, gamerUrl);
+      let result;
+      if (gamerStrategy === 'search') {
+        const items = await getItems(filePath);
+        result = await fetchGamerVideoSnViaSearch(items[itemIdx], gamerId, searchApiUrl);
+      } else {
+        result = await fetchGamerVideoSn(gamerId, gamerUrl);
+      }
+      const { value: videoSn, elapsed, reason } = result;
+
       if (videoSn) {
         const items = await getItems(filePath);
         items[itemIdx].sites[siteIdx] = reorderSiteFields(items[itemIdx].sites[siteIdx], { video_sn: videoSn });
@@ -610,7 +867,7 @@ async function run() {
           recordFailure(skipList, 'gamer', gamerId);
         }
       }
-      await delay(3000);  // 提高请求间隔，避免 bilibili 风控 412
+      await delay(GAMER_DELAY_MS);
     }
     console.log(`\n  video_sn 补全完成：成功 ${doneVideoSn} / 失败 ${failVideoSn}`);
   }
@@ -739,7 +996,9 @@ async function run() {
       related_filled: doneRelated,
       related_failed: failRelated,
       files_modified: fileDirty.size,
+      gamer_strategy: gamerStrategy,
       gamer_url_label: gamerUrlLabel,
+      search_api_label: searchApiLabel,
       skipped_count: skippedCount,
       skip_list_active: skipListActive,
       skip_list_total: skipListTotal,
