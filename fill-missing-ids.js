@@ -45,9 +45,9 @@ const GAMER_SEARCH_HEADERS = {
   'User-Agent': 'Anime/2.29.2 (7N5749MM3F.tw.com.gamer.anime; build:972; iOS 26.0.0) Alamofire/5.6.4',
 };
 
-// skip-list 持久化路径：记录连续失败的条目，达到阈值后跳过 30 天
+// skip-list 持久化路径：记录连续失败的条目，达到阈值后跳过 10 天
 const SKIP_LIST_PATH = path.resolve(__dirname, 'skip-list.json');
-const SKIP_DAYS = 30;
+const SKIP_DAYS = 10;
 const SKIP_FAILURE_THRESHOLD = 3;    // 连续失败 3 次后进入跳过列表
 const MAX_RETRIES = 3;               // 网络错误最多重试 3 次（共 4 次尝试）
 
@@ -130,7 +130,7 @@ function isSkipped(skipList, type, id) {
 
 /**
  * 记录一次失败
- * 连续失败达到阈值后设置 30 天跳过标记
+ * 连续失败达到阈值后设置跳过标记
  */
 function recordFailure(skipList, type, id) {
   if (!skipList[type]) skipList[type] = {};
@@ -739,7 +739,7 @@ async function run() {
   console.log(`  缺失 video_sn：${missingVideoSn.length} 条`);
   console.log(`  待补全 related（配音版本）：${missingRelated.length} 条`);
   if (skippedCount > 0) {
-    console.log(`  跳过列表 (30天内连续失败${SKIP_FAILURE_THRESHOLD}次)：${skippedCount} 条`);
+    console.log(`  跳过列表 (${SKIP_DAYS}天内连续失败${SKIP_FAILURE_THRESHOLD}次)：${skippedCount} 条`);
   }
 
   if (DRY_RUN) {
@@ -779,6 +779,9 @@ async function run() {
 
   const fileCache = {};  // filePath -> items[]
   const fileDirty = new Set();
+  // 同一 ID 在多个文件/site 中出现时，只请求一次并缓存结果
+  const seasonIdCache = {};     // mediaId -> { value, elapsed, reason }
+  const gamerVideoSnCache = {}; // gamerId -> { value, elapsed, reason }
 
   async function getItems(filePath) {
     if (!fileCache[filePath]) {
@@ -807,25 +810,28 @@ async function run() {
       const { filePath, itemIdx, siteIdx, mediaId } = missingSeasonId[idx];
       process.stdout.write(`\r  进度: ${idx + 1}/${missingSeasonId.length}  成功: ${doneSeasonId}  失败: ${failSeasonId}  `);
 
-      const { value: seasonId, elapsed, reason } = await fetchBilibiliSeasonId(mediaId);
+      const cached = !!seasonIdCache[mediaId];
+      const result = cached ? seasonIdCache[mediaId] : await fetchBilibiliSeasonId(mediaId);
+      if (!cached) seasonIdCache[mediaId] = result;
+      const { value: seasonId, elapsed, reason } = result;
       if (seasonId) {
         const items = await getItems(filePath);
         items[itemIdx].sites[siteIdx] = reorderSiteFields(items[itemIdx].sites[siteIdx], { season_id: seasonId });
         fileDirty.add(filePath);
         doneSeasonId++;
-        seasonIdDurations.push(elapsed);
-        recordSuccess(skipList, 'bilibili', mediaId);
+        if (!cached) seasonIdDurations.push(elapsed);
+        if (!cached) recordSuccess(skipList, 'bilibili', mediaId);
       } else {
         failSeasonId++;
         const items = await getItems(filePath);
         const siteName = items[itemIdx].sites[siteIdx].site;
         failedSeasonId.push({ mediaId, site: siteName, filePath: path.relative(BANGUMI_DATA_DIR, filePath), reason });
         // HTTP 412 是临时风控，不计入 skip-list
-        if (!reason || !reason.includes('HTTP 412')) {
+        if (!cached && (!reason || !reason.includes('HTTP 412'))) {
           recordFailure(skipList, 'bilibili', mediaId);
         }
       }
-      await delay(3000);  // 提高请求间隔，避免 bilibili 风控 412
+      if (!cached) await delay(3000);  // 提高请求间隔，避免 bilibili 风控 412
     }
     console.log(`\n  season_id 补全完成：成功 ${doneSeasonId} / 失败 ${failSeasonId}`);
   }
@@ -841,13 +847,17 @@ async function run() {
       const { filePath, itemIdx, siteIdx, gamerId } = missingVideoSn[idx];
       process.stdout.write(`\r  进度: ${idx + 1}/${missingVideoSn.length}  成功: ${doneVideoSn}  失败: ${failVideoSn}  `);
 
+      const cached = !!gamerVideoSnCache[gamerId];
       let result;
-      if (gamerStrategy === 'search') {
+      if (cached) {
+        result = gamerVideoSnCache[gamerId];
+      } else if (gamerStrategy === 'search') {
         const items = await getItems(filePath);
         result = await fetchGamerVideoSnViaSearch(items[itemIdx], gamerId, searchApiUrl);
       } else {
         result = await fetchGamerVideoSn(gamerId, gamerUrl);
       }
+      if (!cached) gamerVideoSnCache[gamerId] = result;
       const { value: videoSn, elapsed, reason } = result;
 
       if (videoSn) {
@@ -855,19 +865,19 @@ async function run() {
         items[itemIdx].sites[siteIdx] = reorderSiteFields(items[itemIdx].sites[siteIdx], { video_sn: videoSn });
         fileDirty.add(filePath);
         doneVideoSn++;
-        videoSnDurations.push(elapsed);
-        recordSuccess(skipList, 'gamer', gamerId);
+        if (!cached) videoSnDurations.push(elapsed);
+        if (!cached) recordSuccess(skipList, 'gamer', gamerId);
       } else {
         failVideoSn++;
         const items = await getItems(filePath);
         const siteName = items[itemIdx].sites[siteIdx].site;
         failedVideoSn.push({ gamerId, site: siteName, filePath: path.relative(BANGUMI_DATA_DIR, filePath), reason });
         // HTTP 412 是临时风控，不计入 skip-list
-        if (!reason || !reason.includes('HTTP 412')) {
+        if (!cached && (!reason || !reason.includes('HTTP 412'))) {
           recordFailure(skipList, 'gamer', gamerId);
         }
       }
-      await delay(GAMER_DELAY_MS);
+      if (!cached) await delay(GAMER_DELAY_MS);
     }
     console.log(`\n  video_sn 补全完成：成功 ${doneVideoSn} / 失败 ${failVideoSn}`);
   }
@@ -882,7 +892,10 @@ async function run() {
       const { filePath, itemIdx, siteIdx, mediaId, label } = missingRelated[idx];
       process.stdout.write(`\r  进度: ${idx + 1}/${missingRelated.length}  成功: ${doneRelated}  失败: ${failRelated}  `);
 
-      const { value: seasonId, reason } = await fetchBilibiliSeasonId(mediaId);
+      const cached = !!seasonIdCache[mediaId];
+      const result = cached ? seasonIdCache[mediaId] : await fetchBilibiliSeasonId(mediaId);
+      if (!cached) seasonIdCache[mediaId] = result;
+      const { value: seasonId, reason } = result;
       if (seasonId) {
         const items = await getItems(filePath);
         const site = items[itemIdx].sites[siteIdx];
@@ -905,7 +918,7 @@ async function run() {
         failRelated++;
         failedRelated.push({ mediaId, label, filePath: path.relative(BANGUMI_DATA_DIR, filePath), reason });
       }
-      await delay(3000);  // 提高请求间隔，避免 bilibili 风控 412
+      if (!cached) await delay(3000);  // 提高请求间隔，避免 bilibili 风控 412
     }
     console.log(`\n  related 配音版本补全完成：成功 ${doneRelated} / 失败 ${failRelated}`);
   }
