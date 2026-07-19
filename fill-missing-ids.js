@@ -34,7 +34,7 @@ const GAMER_PROXY_URL    = 'https://elegy233.netlify.app/bahamutAcg/acgDetail.ph
 
 // gamer 搜索 API 地址（通过标题搜索获取 video_sn，搜索结果直接包含 video_sn）
 const GAMER_SEARCH_DIRECT_URL = 'https://api.gamer.com.tw/mobile_app/anime/v1/search.php?kw=';
-const GAMER_SEARCH_PROXY_URL  = 'https://bahamuts233.netlify.app/bahamut/mobile_app/anime/v1/search.php?kw=';
+const GAMER_SEARCH_PROXY_URL  = 'https://elegy233.netlify.app/bahamut/mobile_app/anime/v1/search.php?kw=';
 
 // gamer 请求间隔（毫秒），应对风控
 const GAMER_DELAY_MS = 5000;
