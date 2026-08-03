@@ -197,16 +197,15 @@ get_upstream_info() {
 
 # 计算下一个发布版本号
 #
-# 根据当前版本与上游版本的关系决定版本号策略（patch 递增）：
+# 版本号乘数扩充法：发布的 Patch = 上游 Patch × 100 + 内部修订次数
+#   主版本号和次版本号与上游保持一致，Patch 末尾两位用于内部发布。
 #
-#   我们领先或平齐上游（cur >= up）→ patch 递增：
-#     在当前大版本基础上 patch+1。
-#     示例：cur=0.3.214-1, up=0.3.213 → 0.3.215
-#           cur=0.3.214,   up=0.3.213 → 0.3.215
-#
-#   上游领先我们（cur < up）→ 对齐上游+1：
-#     紧跟上一步发布的版本。
-#     示例：cur=0.3.214, up=0.3.216 → 0.3.217
+#   上游 patch 升级（up > curUpstreamPatch）→ 对齐上游 × 100，内部重置：
+#     示例：cur=0.3.21702, up=0.3.218 → 0.3.21800
+#   上游未变（up == curUpstreamPatch）→ 内部修订 +1：
+#     示例：cur=0.3.21700, up=0.3.217 → 0.3.21701
+#   上游 major/minor 升级 → 跟随上游，内部重置：
+#     示例：cur=0.3.21705, up=0.4.0 → 0.4.000
 #
 # 参数：$1=CUR_VER（当前版本字符串），$2=UP_VER（上游版本字符串）
 # 用环境变量传参，避免 bash 变量嵌进 JS 导致语法错误
@@ -223,24 +222,23 @@ calc_next_version() {
       return [Number(m[1]), Number(m[2]), Number(m[3])];
     }
 
-    function cmp(a, b) {
-      for (let i = 0; i < 3; i++) {
-        if (a[i] > b[i]) return  1;
-        if (a[i] < b[i]) return -1;
-      }
-      return 0;
-    }
-
     const cur = parseVer(cur_raw);
     const up  = parseVer(up_str);
 
+    // 从当前版本号提取上游追踪版本和内部修订次数
+    const curUpstreamPatch = Math.floor(cur[2] / 100);
+    const curInternal = cur[2] % 100;
+
     let next;
-    if (cmp(cur, up) >= 0) {
-      // 我们领先或平齐上游：在当前基础上 patch+1
-      next = [cur[0], cur[1], cur[2] + 1];
+    if (up[0] > cur[0] || (up[0] === cur[0] && up[1] > cur[1])) {
+      // 上游 major 或 minor 升级：跟随上游，内部重置
+      next = [up[0], up[1], up[2] * 100];
+    } else if (up[2] > curUpstreamPatch) {
+      // 上游 patch 升级：对齐上游 × 100，内部重置
+      next = [cur[0], cur[1], up[2] * 100];
     } else {
-      // 上游领先我们：对齐上游+1
-      next = [up[0], up[1], up[2] + 1];
+      // 上游未变：内部修订 +1
+      next = [cur[0], cur[1], curUpstreamPatch * 100 + (curInternal + 1)];
     }
 
     console.log(next.join('.'));
@@ -739,14 +737,14 @@ fi
 
 # ── 可选：npm publish（建议改用 GitHub Actions）────────────────────────
 #
-# 版本号策略：
+# 版本号策略（乘数扩充法）：
 #   测试模式 (--test-commit / --test-full)：
 #     使用 0.3.200-test.1, 0.3.200-test.2 ... 格式
 #     -test 后缀保证和正式版完全隔离，npm 不会冲突
 #   正式模式：
-#     根据当前版本与上游版本的关系决定策略（详见 calc_next_version 函数注释）：
-#       我们领先或平齐上游 → patch 递增（如 0.3.214 → 0.3.215）
-#       上游领先我们 → 对齐上游+1（如 0.3.217）
+#     发布 Patch = 上游 Patch × 100 + 内部修订次数（详见 calc_next_version 函数注释）
+#     上游 patch 升级 → 对齐上游 × 100（如 0.3.21702 → 0.3.21800）
+#     上游未变 → 内部修订 +1（如 0.3.21700 → 0.3.21701）
 #
 # 触发条件：上游有更新（UPSTREAM_UPDATED=1）或数据文件有补全提交（DATA_COMMITTED=1）
 #
