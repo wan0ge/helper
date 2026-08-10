@@ -677,7 +677,26 @@ else
 
   cleanup_merge "$HELPER_DIR"
   git_with_proxy fetch upstream master "bangumi-data/helper"
-  git merge upstream/master --no-edit || true
+  git merge upstream/master --no-edit -X ours 2>/dev/null || true
+
+  # 冲突自动解决（与 bangumi-data 同步逻辑一致）
+  if git ls-files --unmerged 2>/dev/null | grep -q . \
+      || git status --porcelain 2>/dev/null | grep -qE '^(UU|DU|UD)'; then
+    log "helper 同步检测到合并冲突，正在自动解决..."
+    for f in $(git status --porcelain 2>/dev/null | grep '^DU ' | cut -c4-); do
+      log "  冲突(DU) $f：我们已删除，上游有修改，保持删除"
+      git rm -f -- "$f" 2>/dev/null || true
+    done
+    for f in $(git status --porcelain 2>/dev/null | grep '^UD ' | cut -c4-); do
+      log "  冲突(UD) $f：上游已删除，我们仍有修改，保持我们的版本"
+      git checkout --ours -- "$f" 2>/dev/null || true
+      git add -- "$f" 2>/dev/null || true
+    done
+    git -c user.name="auto-sync" -c user.email="auto-sync@localhost" \
+      commit --no-edit 2>/dev/null || true
+    log "helper 冲突已自动解决，合并完成。"
+  fi
+
   log "helper 同步完成。"
 fi
 
