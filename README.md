@@ -103,14 +103,14 @@ hokan 即为补完（[番組補完計画](https://github.com/bangumi-data/bangum
 | bilibili_tw | ✔️  | ✔️  | ✔️             | ✔️  |
 | crunchyroll | ✔️    | ✔️  | ✔️           | ✔️  |
 | danime    | ✔️    | ✔️  | ✔️             | ✔️  |
-| disneyplus| ✖️    | ✔️  | ✔️             | ✔️  |
+| disneyplus| ✖️    | 🚧  | ✔️             | ✔️  |
 | gamer     | ✔️    | ✔️  | ✔️             | ✔️  |
 | gamer_hk  | ✔️    | ✔️  | ✔️             | ✔️  |
 | iqiyi     | ✔️    | ✔️  | ✖️             | ✖️  |
 | letv      | ✖️    | ✔️  | ✖️             | ✔️  |
 | mgtv      | ✔️    | 🚧  | ✖️             | ✖️  |
 | mytv      | ✔️    | ✔️  | ✔️             | ✔️  |
-| netflix   | ✖️    | ✔️❓| ✔️             | ✔️  |
+| netflix   | ✔️    | ✔️❓| ✔️             | ✔️  |
 | nicovideo | ✔️    | ✔️  | ✔️             | ✖️  |
 | prime     | ✖️    | ✔️  | ✔️             | ✔️  |
 | qq        | ⭕    | ✔️  | ✖️             | ✖️  |
