@@ -34,8 +34,50 @@ LOG_PREFIX="[auto-sync $(date '+%Y-%m-%d %H:%M:%S')]"
 GITHUB_TOKEN=""
 GITHUB_USER="wan0ge"
 
-# GitHub 代理（fetch 用，push 时脚本会自动嵌入 GITHUB_TOKEN）
+# ── Netlify 边缘反代 ────────────────────────────────────────────────
+#
+# 三个专用路径按「整段 URL 前缀替换」的方式工作：目标地址的 GitHub 前缀整体
+# 换成对应的反代路径，而不是把完整 URL 拼接在反代之后。映射关系由 Netlify
+# Edge Function 的 PROXY_CONFIG 定义：
+#
+#   /gh-wan0ge    ← https://github.com/wan0ge              自有仓库，读写
+#   /gh-upstream  ← https://github.com/bangumi-data        上游仓库，只读
+#   /gh-api       ← https://api.github.com/repos/bangumi-data/bangumi-data
+#
+# 重写交由 git 的 url.<base>/.insteadOf 前缀匹配完成，例如：
+#   https://github.com/wan0ge/helper.git
+#     → https://elegy233.netlify.app/gh-wan0ge/helper.git
+#
+# 写操作需要凭据随链路抵达 GitHub：凭据置于反代 URL 的 userinfo 段，使 git
+# 向反代主机发出 Basic Authorization，边缘函数以 headers: request.headers
+# 原样转发请求头，GitHub 据此完成鉴权。只读操作不带凭据。
+NETLIFY_PROXY="https://elegy233.netlify.app"
+WRITE_PROXY="${NETLIFY_PROXY}/gh-wan0ge"
+READ_PROXY="${NETLIFY_PROXY}/gh-upstream"
+API_PROXY="${NETLIFY_PROXY}/gh-api"
+
+# 各反代路径承接的 GitHub 源前缀
+WRITE_PROXY_PREFIX="https://github.com/wan0ge/"
+READ_PROXY_PREFIX="https://github.com/bangumi-data/"
+API_PROXY_PREFIX="https://api.github.com/repos/bangumi-data/bangumi-data"
+
+# 公共 GitHub 代理（读写操作的次级链路）
+#
+# 形态上把完整目标 URL 拼接在代理之后（https://<代理>/https://github.com/…），
+# 与 Netlify 边缘反代的前缀替换不同，两者各自构造一套重写规则。
+# 这类服务不向 GitHub 转交 Authorization，写操作通常止步于 GitHub 的匿名写保护，
+# 但仍保留在链路里：读操作无需凭据即可受益，且个别节点在透传认证时可用。
 GITHUB_PROXIES="https://gh-proxy.org,https://hk.gh-proxy.org,https://cdn.gh-proxy.org,https://edgeone.gh-proxy.org"
+
+# 参与同步的仓库地址
+#
+# 这里直接书写 GitHub 规范地址，而非引用仓库里的 remote 别名：remote URL 由外部
+# 环境决定，可被写成嵌套代理形态，而 insteadOf 依赖 URL 前缀精确匹配，一旦写成
+# 嵌套形态就命中不到重写规则，请求会退化为直连该失效节点。
+ORIGIN_BANGUMI_DATA="https://github.com/wan0ge/bangumi-data.git"
+ORIGIN_HELPER="https://github.com/wan0ge/helper.git"
+UPSTREAM_BANGUMI_DATA="https://github.com/bangumi-data/bangumi-data.git"
+UPSTREAM_HELPER="https://github.com/bangumi-data/helper.git"
 
 # HTTP 代理备选（局域网设备，脚本启动时会自动测试连通性）
 # 例：HTTP_PROXY_LIST="http://192.168.8.234:28235,socks5://192.168.8.231:2080"
@@ -107,7 +149,8 @@ else
   GITHUB_TOKEN_SRC="未配置"
 fi
 
-# 检测 git credential store 是否配置了 gh-proxy 认证
+# 检测 git credential store 是否登记了公共代理的凭据。
+# 未配置 GITHUB_TOKEN 时，这是向公共代理完成写操作的唯一凭据来源。
 CREDENTIAL_STORE_OK=0
 if command -v git >/dev/null 2>&1; then
   if git config --global credential.helper 2>/dev/null | grep -q "store" && [ -f ~/.git-credentials ]; then
@@ -274,212 +317,234 @@ die() {
   exit 1
 }
 
-# ── Git 代理回退函数 ─────────────────────────────────────────────────────────
+# ── Git 反代链路 ─────────────────────────────────────────────────────────────
 #
-# 【push 认证处理（关键！）】
-#   gh-proxy 类代理需要认证信息放在代理 URL 的 auth 位置：
-#     https://wan0ge:ghp_xxx@cdn.gh-proxy.org/https://github.com/...
-#   这样代理会用该认证信息代你向 GitHub 发起 push。
+# 主机到 GitHub 的通路按以下顺序递进，任一步成功即结束：
 #
-#   insteadOf 正确构造方式：
-#     key:   "url.https://user:token@proxy/https://github.com/.insteadOf"
-#     value: "https://github.com/"
-#     效果：https://github.com/foo/bar → https://user:token@proxy/https://github.com/foo/bar
+#   1. Netlify 边缘反代：三个专用路径按「URL 前缀整体替换」改写目标地址，
+#      由 git 的 url.<base>/.insteadOf 完成。写操作需要凭据随链路抵达
+#      GitHub，因此凭据放在反代 URL 的 userinfo 段，git 据此向反代主机发出
+#      Basic Authorization，边缘函数以原请求头转发给 GitHub 完成鉴权。
+#   2. 局域网 HTTP 隧道：HTTP CONNECT 转发，凭据对隧道透明，
+#      仅在 HTTP_PROXY_LIST 非空且隧道可达时启用。
+#   3. 直连：最后兜底。
 #
-# 【fetch 代理（只读，无需认证）】
-#   fetch 使用 url.insteadOf 重写，不需要认证信息。
-#
-# 【http.proxy 备选】
-#   HTTP_PROXY_LIST 中的局域网代理（如 http://192.168.8.234:28235）
-#   通过 HTTP CONNECT 隧道转发，认证对代理透明。
-#   作为备选放在最后，因为需要用户设备开启代理服务。
-#
+# insteadOf 依赖 URL 前缀的精确匹配，因此 git 操作一律使用脚本内写明的
+# GitHub 规范地址，不引用仓库里的 remote 别名。
 
+# 把 GitHub 规范地址改写成对应的 Netlify 反代地址
+# 未匹配到已知前缀时原样返回，交由调用方继续尝试隧道或直连
+to_proxy_url() {
+  case "$1" in
+    "${WRITE_PROXY_PREFIX}"*) printf '%s\n' "${WRITE_PROXY}/${1#${WRITE_PROXY_PREFIX}}" ;;
+    "${READ_PROXY_PREFIX}"*)  printf '%s\n' "${READ_PROXY}/${1#${READ_PROXY_PREFIX}}" ;;
+    # API 前缀不带尾斜杠，剩余部分自带前导斜杠，直接相接以免多出一个斜杠
+    "${API_PROXY_PREFIX}"*)   printf '%s\n' "${API_PROXY}${1#${API_PROXY_PREFIX}}" ;;
+    *)                        printf '%s\n' "$1" ;;
+  esac
+}
+
+# 装配 git 的 url.<base>/.insteadOf 重写参数
+#
+# $1 传 auth 时，把凭据放进自有仓库那条规则的 URL userinfo 段
+# 结果写入 PROXY_ARG_* 三个变量，调用处不加引号展开即得 "-c" 与
+# "url.<base>/.insteadOf=<prefix>" 两个词
+set_proxy_args() {
+  local write_base="$WRITE_PROXY"
+  if [ "$1" = "auth" ] && [ -n "$GITHUB_TOKEN" ]; then
+    write_base="https://${GITHUB_USER}:${GITHUB_TOKEN}@${WRITE_PROXY#https://}"
+  fi
+  PROXY_ARG_WRITE="-c url.${write_base}/.insteadOf=${WRITE_PROXY_PREFIX}"
+  PROXY_ARG_READ="-c url.${READ_PROXY}/.insteadOf=${READ_PROXY_PREFIX}"
+  PROXY_ARG_API="-c url.${API_PROXY}/.insteadOf=${API_PROXY_PREFIX}"
+}
+
+# 逐个尝试公共 GitHub 代理
+#
+# 这类代理把完整目标 URL 拼接在自己之后，形态与 Netlify 边缘反代不同，
+# 因而每个节点都要独立构造一套重写规则：
+#   https://github.com/<owner>/<repo>.git
+#     → https://<代理>/https://github.com/<owner>/<repo>.git
+#
+# auth 模式把凭据放入代理 URL 的 userinfo 段；plain 模式下 git 自行向
+# credential store 索取该代理主机的凭据，无凭据时以匿名身份请求。
+#
+# $1=操作  $2=仓库地址  $3=分支或 refspec  $4=仓库标签  $5=附加参数
+# $6=auth|plain
+try_public_proxies() {
+  local action="$1"
+  local repo="$2"
+  local ref="$3"
+  local repo_path="$4"
+  local extra_args="$5"
+  local mode="$6"
+
+  [ -z "$GITHUB_PROXIES" ] && return 1
+
+  local old_ifs="$IFS"
+  local proxy target
+  IFS=','
+  for proxy in $GITHUB_PROXIES; do
+    IFS="$old_ifs"
+    [ -z "$proxy" ] && continue
+
+    target="url.${proxy}/https://github.com/"
+    if [ "$mode" = "auth" ] && [ -n "$GITHUB_TOKEN" ]; then
+      target="url.https://${GITHUB_USER}:${GITHUB_TOKEN}@${proxy#https://}/https://github.com/"
+    fi
+
+    if git -c "${target}.insteadOf=https://github.com/" \
+          $action "$repo" "$ref" $extra_args --quiet 2>/dev/null; then
+      log "$action ($repo_path) 经公共代理 $proxy 完成"
+      return 0
+    fi
+    log "$action ($repo_path) 公共代理 $proxy 失败"
+    IFS=','
+  done
+  IFS="$old_ifs"
+  return 1
+}
+
+# 经 Netlify 边缘反代执行 git 操作，逐层回退：
+# 边缘反代 → 公共代理 → 局域网 HTTP 隧道 → 直连
+#
+# $1=操作(push/fetch/pull)  $2=仓库的 GitHub 规范地址  $3=分支或 refspec
+# $4=日志中标识仓库的名称  $5=附加给 git 的参数
 git_with_proxy() {
   local action="$1"
-  local remote="$2"
-  local branch="$3"
+  local repo="$2"
+  local ref="$3"
   local repo_path="$4"
   local extra_args="${5:-}"
 
   export GIT_TERMINAL_PROMPT=0
 
-  # ── push：优先直连（remote URL 已嵌入 token）──
+  # push 需要凭据随链路抵达 GitHub，其余操作走不带凭据的只读链路
   if [ "$action" = "push" ]; then
-    if git $action "$remote" "$branch" $extra_args 2>/dev/null; then
-      log "$action ($repo_path) 直连成功"
-      return 0
-    fi
-    log "$action ($repo_path) 直连失败，回退尝试代理..."
-
-    # 尝试通过 gh-proxy 代理 push（需要 GITHUB_TOKEN 或 credential store）
-    if [ -n "$GITHUB_TOKEN" ]; then
-      # 方式 A：嵌入 token 到代理 URL auth 位置
-      OLD_IFS="$IFS"
-      IFS=','
-      for proxy in $GITHUB_PROXIES; do
-        IFS="$OLD_IFS"
-
-        local proxy_host="${proxy#https://}"
-        local auth_base="https://${GITHUB_USER}:${GITHUB_TOKEN}@${proxy_host}"
-        local instead_of_key="url.${auth_base}/https://github.com/.insteadOf"
-        local instead_of_val="https://github.com/"
-
-        if git -c "$instead_of_key=$instead_of_val" \
-              $action "$remote" "$branch" $extra_args --quiet 2>/dev/null; then
-          log "$action ($repo_path) 通过代理 $proxy (token 嵌入) 成功"
-          return 0
-        fi
-        log "$action ($repo_path) 代理 $proxy 失败，错误详情："
-        local proxy_err
-        proxy_err=$(git -c "$instead_of_key=$instead_of_val" \
-            $action "$remote" "$branch" $extra_args 2>&1) || true
-        echo "$proxy_err" | sed 's/^/  | /' >&2
-        IFS=','
-      done
-      IFS="$OLD_IFS"
-    elif [ "$CREDENTIAL_STORE_OK" = "1" ]; then
-      # 方式 B：git credential store 已配置 gh-proxy 认证
-      # remote URL 已经指向 gh-proxy（如 https://cdn.gh-proxy.org/https://github.com/...）
-      # git 会自动从 credential store 提供认证信息
-      log "$action ($repo_path) 使用 git credential store 认证尝试代理 push..."
-      OLD_IFS="$IFS"
-      IFS=','
-      for proxy in $GITHUB_PROXIES; do
-        IFS="$OLD_IFS"
-        local instead_of_key="url.${proxy}/https://github.com/.insteadOf"
-        local instead_of_val="https://github.com/"
-
-        if git -c "$instead_of_key=$instead_of_val" \
-              $action "$remote" "$branch" $extra_args --quiet 2>/dev/null; then
-          log "$action ($repo_path) 通过代理 $proxy (credential store) 成功"
-          return 0
-        fi
-        log "$action ($repo_path) 代理 $proxy (credential store) 失败，错误详情："
-        local proxy_err
-        proxy_err=$(git -c "$instead_of_key=$instead_of_val" \
-            $action "$remote" "$branch" $extra_args 2>&1) || true
-        echo "$proxy_err" | sed 's/^/  | /' >&2
-        IFS=','
-      done
-      IFS="$OLD_IFS"
-    else
-      log "$action ($repo_path) 未设置 GITHUB_TOKEN，且未配置 git credential store，跳过代理 push（代理需要认证）"
-    fi
-
-    # 尝试 HTTP CONNECT 隧道代理（http.proxy 备选）
-    if [ -n "$HTTP_PROXY_LIST" ]; then
-      OLD_IFS="$IFS"
-      IFS=','
-      for hp in $HTTP_PROXY_LIST; do
-        IFS="$OLD_IFS"
-        log "$action ($repo_path) 尝试 HTTP 隧道代理 $hp ..."
-        if git -c "http.proxy=$hp" \
-              $action "$remote" "$branch" $extra_args --quiet 2>/dev/null; then
-          log "$action ($repo_path) 通过 HTTP 隧道代理 $hp 成功"
-          return 0
-        fi
-        log "$action ($repo_path) HTTP 隧道代理 $hp 失败"
-        IFS=','
-      done
-      IFS="$OLD_IFS"
-    fi
-
-    # push 所有路径失败，输出详细错误
-    log "$action ($repo_path) 所有路径均失败，错误详情："
-    local final_out
-    final_out=$(git $action "$remote" "$branch" $extra_args 2>&1) || true
-    echo "$final_out" | sed 's/^/  | /' >&2
-
-    # push 特殊处理：Everything up-to-date 但无传输中断 → 数据已成功送达远端
-    if echo "$final_out" | grep -q "Everything up-to-date" \
-      && ! echo "$final_out" | grep -qE "(send-pack: unexpected disconnect|the remote end hung up unexpectedly)"; then
-      log "$action ($repo_path) 虽所有路径报错，但 Everything up-to-date（数据已成功推送，连接断开为网络波动）"
-      return 0
-    fi
-
-    echo "$LOG_PREFIX ERROR: $action ($repo_path) 所有代理和直连均不可用（错误详情见上方输出）" >&2
-    return 1
+    set_proxy_args auth
+  else
+    set_proxy_args plain
   fi
 
-  # ── fetch（只读，代理不需要认证）──
-  OLD_IFS="$IFS"
-  IFS=','
-  for proxy in $GITHUB_PROXIES; do
-    IFS="$OLD_IFS"
-    if git -c "url.${proxy}/https://github.com/.insteadOf=https://github.com/" \
-          $action "$remote" "$branch" $extra_args --quiet 2>/dev/null; then
-      log "$action ($repo_path) 通过代理 $proxy 成功"
+  # 1. Netlify 边缘反代
+  if git $PROXY_ARG_WRITE $PROXY_ARG_READ $PROXY_ARG_API \
+        $action "$repo" "$ref" $extra_args --quiet 2>/dev/null; then
+    log "$action ($repo_path) 经 Netlify 边缘反代完成"
+    return 0
+  fi
+  log "$action ($repo_path) 边缘反代不可用，尝试公共代理..."
+
+  # 2. 公共 GitHub 代理
+  # 写操作把凭据嵌入代理 URL；没有 GITHUB_TOKEN 时交给 credential store 供给，
+  # 两者皆无则该层完成不了写操作，跳过以免空跑一轮。
+  if [ "$action" != "push" ] || [ -n "$GITHUB_TOKEN" ] || [ "$CREDENTIAL_STORE_OK" = "1" ]; then
+    if [ "$action" = "push" ] && [ -n "$GITHUB_TOKEN" ]; then
+      public_mode="auth"
+    else
+      public_mode="plain"
+    fi
+    if try_public_proxies "$action" "$repo" "$ref" "$repo_path" "$extra_args" "$public_mode"; then
       return 0
     fi
-    # 代理失败，输出错误详情
-    log "$action ($repo_path) 代理 $proxy 失败，错误详情："
-    local fetch_err
-    fetch_err=$(git -c "url.${proxy}/https://github.com/.insteadOf=https://github.com/" \
-        $action "$remote" "$branch" $extra_args 2>&1) || true
-    echo "$fetch_err" | sed 's/^/  | /' >&2
-    IFS=','
-  done
-  IFS="$OLD_IFS"
+  else
+    log "$action ($repo_path) 缺少公共代理凭据（无 GITHUB_TOKEN，credential store 未登记），跳过该层"
+  fi
 
-  # fetch 操作：代理全失败后回退直连
-  log "$action ($repo_path) 所有代理不可用，尝试直连 GitHub..."
-  if git $action "$remote" "$branch" $extra_args 2>/dev/null; then
-    log "$action ($repo_path) 直连成功"
+  # 3. 局域网 HTTP 隧道（HTTP CONNECT 转发，凭据对隧道透明）
+  if [ -n "$HTTP_PROXY_LIST" ]; then
+    local old_ifs="$IFS"
+    IFS=','
+    for hp in $HTTP_PROXY_LIST; do
+      IFS="$old_ifs"
+      if git -c "http.proxy=$hp" $action "$repo" "$ref" $extra_args --quiet 2>/dev/null; then
+        log "$action ($repo_path) 经 HTTP 隧道 $hp 完成"
+        return 0
+      fi
+      log "$action ($repo_path) HTTP 隧道 $hp 失败"
+      IFS=','
+    done
+    IFS="$old_ifs"
+  fi
+
+  # 4. 直连
+  log "$action ($repo_path) 隧道不可用，尝试直连..."
+  if git $action "$repo" "$ref" $extra_args --quiet 2>/dev/null; then
+    log "$action ($repo_path) 直连完成"
     return 0
   fi
 
-  # 最后一次尝试：输出详细错误
   log "$action ($repo_path) 所有路径均失败，错误详情："
-  final_out=$(git $action "$remote" "$branch" $extra_args 2>&1) || true
+  local final_out
+  final_out=$(git $action "$repo" "$ref" $extra_args 2>&1) || true
   echo "$final_out" | sed 's/^/  | /' >&2
 
-  echo "$LOG_PREFIX ERROR: $action ($repo_path) 所有代理和直连均不可用（错误详情见上方输出）" >&2
+  # 远端已含所推内容时 git 判定无需推送，网络层的断开不改变该结论
+  if echo "$final_out" | grep -q "Everything up-to-date" \
+    && ! echo "$final_out" | grep -qE "(send-pack: unexpected disconnect|the remote end hung up unexpectedly)"; then
+    log "$action ($repo_path) 远端已是最新（Everything up-to-date）"
+    return 0
+  fi
+
+  echo "$LOG_PREFIX ERROR: $action ($repo_path) 边缘反代、公共代理、HTTP 隧道与直连均失败（详情见上方）" >&2
   return 1
 }
 
-# GitHub HTTP API 请求（带代理回退）
+# GitHub HTTP API 请求（带反代回退）
 # 用法：curl_github <url> [timeout]
-# 尝试顺序与 git_with_proxy fetch 一致：gh-proxy 镜像 → HTTP 隧道代理 → 直连
+# 尝试顺序与 git_with_proxy 一致：Netlify 边缘反代 → 局域网 HTTP 隧道 → 直连
 # 成功时输出响应到 stdout 并返回 0，失败返回 1
+# 逐个尝试公共代理、再回退到局域网隧道与直连
 curl_github() {
   local url="$1"
   local timeout="${2:-10}"
   local out
+  local proxied
+  local old_ifs="$IFS"
+  local hp
+  local proxy
 
-  # 1. gh-proxy 镜像（URL 重写，无需认证）
-  local OLD_IFS="$IFS"
+  proxied=$(to_proxy_url "$url")
+
+  if out=$(curl -s -m "$timeout" "$proxied" 2>/dev/null) && [ -n "$out" ]; then
+    log "curl ($url) 经 Netlify 边缘反代完成"
+    echo "$out"
+    return 0
+  fi
+  log "curl ($url) 边缘反代不可用，尝试公共代理..."
+
+  local proxy
   IFS=','
   for proxy in $GITHUB_PROXIES; do
-    IFS="$OLD_IFS"
+    IFS="$old_ifs"
+    [ -z "$proxy" ] && continue
     if out=$(curl -s -m "$timeout" "${proxy}/${url}" 2>/dev/null) && [ -n "$out" ]; then
-      log "curl ($url) 通过代理 $proxy 成功"
+      log "curl ($url) 经公共代理 $proxy 完成"
       echo "$out"
       return 0
     fi
     IFS=','
   done
-  IFS="$OLD_IFS"
+  IFS="$old_ifs"
 
-  # 2. HTTP 隧道代理（HTTP CONNECT，认证对代理透明）
+  log "curl ($url) 公共代理不可用，尝试局域网 HTTP 隧道..."
+
   if [ -n "$HTTP_PROXY_LIST" ]; then
-    OLD_IFS="$IFS"
     IFS=','
     for hp in $HTTP_PROXY_LIST; do
-      IFS="$OLD_IFS"
+      IFS="$old_ifs"
       if out=$(curl -s -m "$timeout" --proxy "$hp" "$url" 2>/dev/null) && [ -n "$out" ]; then
-        log "curl ($url) 通过 HTTP 隧道代理 $hp 成功"
+        log "curl ($url) 经 HTTP 隧道 $hp 完成"
         echo "$out"
         return 0
       fi
       IFS=','
     done
-    IFS="$OLD_IFS"
+    IFS="$old_ifs"
   fi
 
-  # 3. 直连（最后尝试）
+  log "curl ($url) 隧道不可用，尝试直连..."
   if out=$(curl -s -m "$timeout" "$url" 2>/dev/null) && [ -n "$out" ]; then
-    log "curl ($url) 直连成功"
+    log "curl ($url) 直连完成"
     echo "$out"
     return 0
   fi
@@ -488,48 +553,62 @@ curl_github() {
   return 1
 }
 
-# git ls-remote（带代理回退）
+# git ls-remote（带反代回退）
 # 用法：git_ls_remote_with_proxy <args...>（参数直接传递给 git ls-remote）
-# 尝试顺序与 git_with_proxy fetch 一致：gh-proxy 镜像 → HTTP 隧道代理 → 直连
+# 尝试顺序与 git_with_proxy 一致：
+# Netlify 边缘反代 → 公共代理 → 局域网 HTTP 隧道 → 直连
 # 成功时输出结果到 stdout 并返回 0，失败返回 1
 git_ls_remote_with_proxy() {
   local out
+  local old_ifs="$IFS"
+  local hp
+  local proxy
 
-  # 1. gh-proxy 镜像（URL 重写，无需认证）
-  local OLD_IFS="$IFS"
+  set_proxy_args plain
+
+  if out=$(GIT_TERMINAL_PROMPT=0 git $PROXY_ARG_WRITE $PROXY_ARG_READ $PROXY_ARG_API \
+        ls-remote "$@" 2>/dev/null) && [ -n "$out" ]; then
+    log "ls-remote 经 Netlify 边缘反代完成"
+    echo "$out"
+    return 0
+  fi
+  log "ls-remote 边缘反代不可用，尝试公共代理..."
+
   IFS=','
   for proxy in $GITHUB_PROXIES; do
-    IFS="$OLD_IFS"
-    if out=$(GIT_TERMINAL_PROMPT=0 git -c "url.${proxy}/https://github.com/.insteadOf=https://github.com/" \
-          ls-remote "$@" 2>/dev/null); then
-      log "ls-remote 通过代理 $proxy 成功"
+    IFS="$old_ifs"
+    [ -z "$proxy" ] && continue
+    if out=$(GIT_TERMINAL_PROMPT=0 \
+          git -c "url.${proxy}/https://github.com/.insteadOf=https://github.com/" \
+          ls-remote "$@" 2>/dev/null) && [ -n "$out" ]; then
+      log "ls-remote 经公共代理 $proxy 完成"
       echo "$out"
       return 0
     fi
     IFS=','
   done
-  IFS="$OLD_IFS"
+  IFS="$old_ifs"
 
-  # 2. HTTP 隧道代理
+  log "ls-remote 公共代理不可用，尝试局域网 HTTP 隧道..."
+
   if [ -n "$HTTP_PROXY_LIST" ]; then
-    OLD_IFS="$IFS"
     IFS=','
     for hp in $HTTP_PROXY_LIST; do
-      IFS="$OLD_IFS"
+      IFS="$old_ifs"
       if out=$(GIT_TERMINAL_PROMPT=0 git -c "http.proxy=$hp" -c "http.sslVerify=false" \
-            ls-remote "$@" 2>/dev/null); then
-        log "ls-remote 通过 HTTP 隧道代理 $hp 成功"
+            ls-remote "$@" 2>/dev/null) && [ -n "$out" ]; then
+        log "ls-remote 经 HTTP 隧道 $hp 完成"
         echo "$out"
         return 0
       fi
       IFS=','
     done
-    IFS="$OLD_IFS"
+    IFS="$old_ifs"
   fi
 
-  # 3. 直连（最后尝试）
-  if out=$(GIT_TERMINAL_PROMPT=0 git ls-remote "$@" 2>/dev/null); then
-    log "ls-remote 直连成功"
+  log "ls-remote 隧道不可用，尝试直连..."
+  if out=$(GIT_TERMINAL_PROMPT=0 git ls-remote "$@" 2>/dev/null) && [ -n "$out" ]; then
+    log "ls-remote 直连完成"
     echo "$out"
     return 0
   fi
@@ -576,7 +655,7 @@ log "helper:       $HELPER_DIR"
 log "bangumi-data: $BANGUMI_DATA_DIR"
 log "token:        ${GITHUB_TOKEN_SRC}"
 if [ "$CREDENTIAL_STORE_OK" = "1" ]; then
-  log "cred store:   ~/.git-credentials (gh-proxy 可用)"
+  log "cred store:   ~/.git-credentials 已登记公共代理凭据"
 fi
 
 # ── HTTP 代理连通性测试（只保留可用的） ────────────────────────────────────
@@ -613,16 +692,14 @@ else
   log "同步 bangumi-data 上游..."
   cd "$BANGUMI_DATA_DIR"
 
-  git remote get-url upstream >/dev/null 2>&1 || \
-    git remote add upstream https://github.com/bangumi-data/bangumi-data.git
-
   cleanup_merge "$BANGUMI_DATA_DIR"
-  git_with_proxy fetch upstream master "bangumi-data/bangumi-data"
+  git_with_proxy fetch "$UPSTREAM_BANGUMI_DATA" master "bangumi-data/bangumi-data"
   git checkout master --quiet 2>/dev/null || true
 
   # 记录 fetch 前的 HEAD，用于判断上游是否有新内容
   _before=$(git rev-parse HEAD 2>/dev/null || echo "")
-  git merge upstream/master --no-edit -X ours 2>/dev/null || true
+  # 合并说明显式给出：git 的默认标题会把 insteadOf 改写后的反代地址写进去
+  git merge FETCH_HEAD -X ours -m "merge: 同步上游 bangumi-data" 2>/dev/null || true
 
   # merge 失败后，检测并自动解决冲突
   #   git ls-files --unmerged 无法检测 DU/UD（modify/delete）冲突，
@@ -672,12 +749,10 @@ else
   log "同步 helper 上游..."
   cd "$HELPER_DIR"
 
-  git remote get-url upstream >/dev/null 2>&1 || \
-    git remote add upstream https://github.com/bangumi-data/helper.git
-
   cleanup_merge "$HELPER_DIR"
-  git_with_proxy fetch upstream master "bangumi-data/helper"
-  git merge upstream/master --no-edit -X ours 2>/dev/null || true
+  git_with_proxy fetch "$UPSTREAM_HELPER" master "bangumi-data/helper"
+  # 合并说明显式给出：git 的默认标题会把 insteadOf 改写后的反代地址写进去
+  git merge FETCH_HEAD -X ours -m "merge: 同步上游 helper" 2>/dev/null || true
 
   # 冲突自动解决（与 bangumi-data 同步逻辑一致）
   if git ls-files --unmerged 2>/dev/null | grep -q . \
@@ -854,9 +929,14 @@ if [ "$DATA_COMMITTED" = "1" ] || [ "$FORCE_PUSH" = "1" ]; then
   while [ $PUSH_TRIES -lt 3 ]; do
     PUSH_TRIES=$((PUSH_TRIES + 1))
     cleanup_merge "$BANGUMI_DATA_DIR"
-    git_with_proxy pull origin master "bangumi-data/bangumi-data" "--allow-unrelated-histories --no-rebase --no-edit -X ours" || log "pull 失败，跳过同步远程..."
+    # 先取回落后再合并。合并说明显式给出，避免默认标题写入反代地址
+    git_with_proxy fetch "$ORIGIN_BANGUMI_DATA" master "bangumi-data/bangumi-data" \
+      || log "fetch 失败，跳过同步远程..."
+    git merge FETCH_HEAD -X ours --allow-unrelated-histories \
+      -m "merge: 同步远端 bangumi-data" 2>/dev/null \
+      || log "远端无新内容或与本地无关联，按当前内容推送..."
     # 先推 master 分支（不含 tags）
-    if git_with_proxy push origin master "bangumi-data/bangumi-data"; then
+    if git_with_proxy push "$ORIGIN_BANGUMI_DATA" master "bangumi-data/bangumi-data"; then
       PUSH_OK=1
       log "bangumi-data master 推送成功。"
       break
@@ -874,16 +954,16 @@ if [ "$DATA_COMMITTED" = "1" ] || [ "$FORCE_PUSH" = "1" ]; then
   log "推送 bangumi-data tags..."
   NEXT_VER_TAG="v$NEXT_VER"
   if [ -n "$NEXT_VER_TAG" ] && [ "$NEXT_VER_TAG" != "v" ]; then
-    remote_ref="$(git_ls_remote_with_proxy --tags origin "refs/tags/$NEXT_VER_TAG" | awk '{print $1}')"
+    remote_ref="$(git_ls_remote_with_proxy --tags "$ORIGIN_BANGUMI_DATA" "refs/tags/$NEXT_VER_TAG" | awk '{print $1}')"
     local_ref="$(git rev-parse "$NEXT_VER_TAG" 2>/dev/null)"
     if [ -z "$remote_ref" ]; then
       log "tag $NEXT_VER_TAG 远端不存在，创建..."
       git tag -f "$NEXT_VER_TAG" >/dev/null 2>&1
-      git_with_proxy push origin "refs/tags/$NEXT_VER_TAG" "bangumi-data/bangumi-data (tag $NEXT_VER_TAG)"
+      git_with_proxy push "$ORIGIN_BANGUMI_DATA" "refs/tags/$NEXT_VER_TAG" "bangumi-data/bangumi-data (tag $NEXT_VER_TAG)"
     elif [ "$local_ref" != "$remote_ref" ]; then
       log "tag $NEXT_VER_TAG 远端指向不同 commit ($remote_ref)，强制更新..."
       git tag -f "$NEXT_VER_TAG" >/dev/null 2>&1
-      git_with_proxy push origin "refs/tags/$NEXT_VER_TAG" "bangumi-data/bangumi-data (tag $NEXT_VER_TAG)" "--force"
+      git_with_proxy push "$ORIGIN_BANGUMI_DATA" "refs/tags/$NEXT_VER_TAG" "bangumi-data/bangumi-data (tag $NEXT_VER_TAG)" "--force"
     else
       log "tag $NEXT_VER_TAG 远端已存在且相同，跳过。"
     fi
@@ -900,8 +980,11 @@ if [ "$DATA_COMMITTED" = "1" ] || [ "$FORCE_PUSH" = "1" ]; then
   while [ $PUSH_TRIES -lt 3 ]; do
     PUSH_TRIES=$((PUSH_TRIES + 1))
     cleanup_merge "$HELPER_DIR"
-    git_with_proxy pull origin master "bangumi-data/helper" "--no-rebase --no-edit" || log "pull 失败，跳过同步远程..."
-    if git_with_proxy push origin master "bangumi-data/helper"; then
+    git_with_proxy fetch "$ORIGIN_HELPER" master "bangumi-data/helper" \
+      || log "fetch 失败，跳过同步远程..."
+    git merge FETCH_HEAD -m "merge: 同步远端 helper" 2>/dev/null \
+      || log "远端无新内容，按当前内容推送..."
+    if git_with_proxy push "$ORIGIN_HELPER" master "bangumi-data/helper"; then
       PUSH_OK=1
       break
     fi
