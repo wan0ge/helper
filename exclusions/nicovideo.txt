@@ -23,7 +23,6 @@ numaochi
 bitatama
 nijisai-anime
 shisyunkidai2
-227keisanchu2
 higurashianime
 riskit
 noriko-iiyone
@@ -34,12 +33,8 @@ anime-86
 oyster
 dogengers_nb
 m-78_trigger
-hello-prichan-world
 NextStarsCircle
 dogengers_
-tiramisu2-stage
-musical-dreaming
-durarara-stage
 m-78_decker
 ultraman-blazar
 aotu
@@ -261,6 +256,4 @@ ch2591
 jan39tv
 tongarikids
 sky-cladde
-anonymous2020-exhibition
-7-sins-zange
 megamikorin
