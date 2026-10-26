@@ -309,8 +309,16 @@ send_dingtalk_notification() {
 }
 
 die() {
-  echo "$LOG_PREFIX ERROR: $1" >&2
-  send_dingtalk_notification "auto-sync 执行失败" "❌ 错误: $1
+  local detail="$1"
+  echo "$LOG_PREFIX ERROR: $detail" >&2
+  # 推送阶段已产生的各仓库结果一并带出，便于分辨「部分成功」的情形
+  if [ -n "${PUSH_SUMMARY:-}" ]; then
+    detail="$detail
+
+🚀 **推送:**
+${PUSH_SUMMARY}"
+  fi
+  send_dingtalk_notification "auto-sync 执行失败" "❌ 错误: $detail
 
 时间: $(get_cst_time)
 来自：bangumi data"
@@ -919,7 +927,10 @@ fi
 if [ "$DATA_COMMITTED" = "1" ] || [ "$FORCE_PUSH" = "1" ]; then
   [ "$FORCE_PUSH" = "1" ] && log "--force-push 模式：即使无数据变更也测试推送链路..."
 
-  # 推送 bangumi-data（含重试，先 pull 再 push）
+  # 逐仓库累计推送结果，失败通知据此区分「部分成功」的情形
+  PUSH_SUMMARY=""
+
+  # 推送 bangumi-data（含重试，先取回落再推）
   log "推送 bangumi-data 到 GitHub..."
   cd "$BANGUMI_DATA_DIR"
   PUSH_TRIES=0
@@ -936,6 +947,8 @@ if [ "$DATA_COMMITTED" = "1" ] || [ "$FORCE_PUSH" = "1" ]; then
     # 先推 master 分支（不含 tags）
     if git_with_proxy push "$ORIGIN_BANGUMI_DATA" master "bangumi-data/bangumi-data"; then
       PUSH_OK=1
+      PUSH_SUMMARY="${PUSH_SUMMARY}* bangumi-data: ✅ 已推送
+"
       log "bangumi-data master 推送成功。"
       break
     fi
@@ -945,6 +958,8 @@ if [ "$DATA_COMMITTED" = "1" ] || [ "$FORCE_PUSH" = "1" ]; then
     fi
   done
   if [ $PUSH_OK -ne 1 ]; then
+    PUSH_SUMMARY="${PUSH_SUMMARY}* bangumi-data: ❌ 推送失败
+"
     die "bangumi-data 推送失败（master 分支），已重试3次"
   fi
 
@@ -984,6 +999,8 @@ if [ "$DATA_COMMITTED" = "1" ] || [ "$FORCE_PUSH" = "1" ]; then
       || log "远端无新内容，按当前内容推送..."
     if git_with_proxy push "$ORIGIN_HELPER" master "bangumi-data/helper"; then
       PUSH_OK=1
+      PUSH_SUMMARY="${PUSH_SUMMARY}* helper: ✅ 已推送
+"
       break
     fi
     if [ $PUSH_TRIES -lt 3 ]; then
@@ -992,6 +1009,8 @@ if [ "$DATA_COMMITTED" = "1" ] || [ "$FORCE_PUSH" = "1" ]; then
     fi
   done
   if [ $PUSH_OK -ne 1 ]; then
+    PUSH_SUMMARY="${PUSH_SUMMARY}* helper: ❌ 推送失败
+"
     die "helper 推送失败，已重试3次"
   fi
   log "helper 推送完成。"
@@ -1065,7 +1084,8 @@ if [ "$DATA_COMMITTED" = "1" ]; then
 ${VERSION_SECTION}
 ${STATS_SECTION}
 
-🚀 **推送:** ✅ 已推送至 GitHub
+🚀 **推送:**
+${PUSH_SUMMARY}
 
 时间: $(get_cst_time)
 来自：bangumi data"
