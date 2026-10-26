@@ -65,8 +65,8 @@ API_PROXY_PREFIX="https://api.github.com/repos/bangumi-data/bangumi-data"
 #
 # 形态上把完整目标 URL 拼接在代理之后（https://<代理>/https://github.com/…），
 # 与 Netlify 边缘反代的前缀替换不同，两者各自构造一套重写规则。
-# 这类服务不向 GitHub 转交 Authorization，写操作通常止步于 GitHub 的匿名写保护，
-# 但仍保留在链路里：读操作无需凭据即可受益，且个别节点在透传认证时可用。
+# 这类服务不向 GitHub 转交 Authorization，写操作止步于 GitHub 的匿名写保护；
+# 读操作无需凭据即可受益，个别节点在透传认证时亦可用于写操作。
 GITHUB_PROXIES="https://gh-proxy.org,https://hk.gh-proxy.org,https://cdn.gh-proxy.org,https://edgeone.gh-proxy.org"
 
 # 参与同步的仓库地址
@@ -79,9 +79,9 @@ ORIGIN_HELPER="https://github.com/wan0ge/helper.git"
 UPSTREAM_BANGUMI_DATA="https://github.com/bangumi-data/bangumi-data.git"
 UPSTREAM_HELPER="https://github.com/bangumi-data/helper.git"
 
-# HTTP 代理备选（局域网设备，脚本启动时会自动测试连通性）
-# 例：HTTP_PROXY_LIST="http://192.168.8.234:28235,socks5://192.168.8.231:2080"
-HTTP_PROXY_LIST=""
+# HTTP 代理备选（局域网设备）
+# 脚本启动时逐个测试连通性，不可达的节点会从本轮列表中剔除
+HTTP_PROXY_LIST="http://192.168.8.234:28235,http://192.168.8.139:28235,socks5://192.168.8.231:2080,http://192.168.8.105:28235"
 
 DO_PUBLISH=0
 DRY_RUN=0
@@ -438,10 +438,9 @@ git_with_proxy() {
   # 写操作把凭据嵌入代理 URL；没有 GITHUB_TOKEN 时交给 credential store 供给，
   # 两者皆无则该层完成不了写操作，跳过以免空跑一轮。
   if [ "$action" != "push" ] || [ -n "$GITHUB_TOKEN" ] || [ "$CREDENTIAL_STORE_OK" = "1" ]; then
+    local public_mode="plain"
     if [ "$action" = "push" ] && [ -n "$GITHUB_TOKEN" ]; then
       public_mode="auth"
-    else
-      public_mode="plain"
     fi
     if try_public_proxies "$action" "$repo" "$ref" "$repo_path" "$extra_args" "$public_mode"; then
       return 0
@@ -491,9 +490,9 @@ git_with_proxy() {
 
 # GitHub HTTP API 请求（带反代回退）
 # 用法：curl_github <url> [timeout]
-# 尝试顺序与 git_with_proxy 一致：Netlify 边缘反代 → 局域网 HTTP 隧道 → 直连
+# 尝试顺序与 git_with_proxy 一致：
+# Netlify 边缘反代 → 公共代理 → 局域网 HTTP 隧道 → 直连
 # 成功时输出响应到 stdout 并返回 0，失败返回 1
-# 逐个尝试公共代理、再回退到局域网隧道与直连
 curl_github() {
   local url="$1"
   local timeout="${2:-10}"
@@ -512,7 +511,6 @@ curl_github() {
   fi
   log "curl ($url) 边缘反代不可用，尝试公共代理..."
 
-  local proxy
   IFS=','
   for proxy in $GITHUB_PROXIES; do
     IFS="$old_ifs"
